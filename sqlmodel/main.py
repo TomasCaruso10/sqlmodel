@@ -5,10 +5,12 @@ import ipaddress
 import uuid
 import warnings
 from collections.abc import Callable, Mapping, Sequence, Set
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum
+from functools import update_wrapper, wraps
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -24,8 +26,16 @@ from typing import (
     overload,
 )
 
-from pydantic import AwareDatetime, BaseModel, Discriminator, EmailStr, NaiveDatetime
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    Discriminator,
+    EmailStr,
+    GetCoreSchemaHandler,
+    NaiveDatetime,
+)
 from pydantic.fields import FieldInfo as PydanticFieldInfo
+from pydantic_core import CoreSchema, core_schema
 from sqlalchemy import (
     Boolean,
     Column,
@@ -57,22 +67,22 @@ from typing_extensions import dataclass_transform, deprecated
 from ._compat import (
     PYDANTIC_MINOR_VERSION,
     BaseConfig,
+    InstanceDictProxy,
     ModelMetaclass,
+    ObjectWithUpdateWrapper,
     Representation,
     SQLModelConfig,
     Undefined,
     UndefinedType,
-    finish_init,
     get_annotations,
     get_field_metadata,
     get_model_fields,
     get_relationship_to,
     get_sa_type_from_field,
     init_pydantic_private_attrs,
+    instance_from_fields,
     is_field_noneable,
     is_table_model_class,
-    sqlmodel_init,
-    sqlmodel_validate,
 )
 from .sql.sqltypes import AutoString, UTCDateTime
 
@@ -843,6 +853,7 @@ _TSQLModel = TypeVar("_TSQLModel", bound="SQLModel")
 class SQLModel(BaseModel, metaclass=SQLModelMetaclass, registry=default_registry):
     # SQLAlchemy needs to set weakref(s), Pydantic will set the other slots values
     __slots__ = ("__weakref__",)
+    __dict__ = InstanceDictProxy()
     __tablename__: ClassVar[str | Callable[..., str]]
     __sqlmodel_relationships__: ClassVar[builtins.dict[str, RelationshipInfo]]
     __name__: ClassVar[str]
@@ -862,38 +873,148 @@ class SQLModel(BaseModel, metaclass=SQLModelMetaclass, registry=default_registry
         init_pydantic_private_attrs(new_object)
         return new_object
 
-    def __init__(__pydantic_self__, **data: Any) -> None:
+    def __init__(__pydantic_self__, /, **data: Any) -> None:
         # Uses something other than `self` the first arg to allow "self" as a
         # settable attribute
+        # SQLAlchemy's generated initializer does not preserve positional-only args.
+        if instance_from_fields.get() is __pydantic_self__:
+            # SQLAlchemy has prepared its state; deliver fields without validating again.
+            __pydantic_self__.__dict__ = data
+        else:
+            super().__init__(**data)
 
-        # SQLAlchemy does very dark black magic and modifies the __init__ method in
-        # sqlalchemy.orm.instrumentation._generate_init()
-        # so, to make SQLAlchemy work, it's needed to explicitly call __init__ to
-        # trigger all the SQLAlchemy logic, it doesn't work using cls.__new__, setting
-        # attributes obj.__dict__, etc. The __init__ method has to be called. But
-        # there are cases where calling all the default logic is not ideal, e.g.
-        # when calling Model.model_validate(), as the validation is done outside
-        # of instance creation.
-        # At the same time, __init__ is what users would normally call, by creating
-        # a new instance, which should have validation and all the default logic.
-        # So, to be able to set up the internal SQLAlchemy logic alone without
-        # executing the rest, and support things like Model.model_validate(), we
-        # use a contextvar to know if we should execute everything.
-        if finish_init.get():
-            sqlmodel_init(self=__pydantic_self__, data=data)
+    # Preserve Pydantic's initializer marker without changing its static signature.
+    update_wrapper(__init__, BaseModel.__init__)
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source: Any, handler: GetCoreSchemaHandler
+    ) -> CoreSchema:
+        schema = handler(source)
+        # Model validators can wrap the model node. Keep those wrappers intact.
+        model_schema = schema
+        while (
+            model_schema["type"] == "function-before"
+            or model_schema["type"] == "function-after"
+            or model_schema["type"] == "function-wrap"
+        ):
+            model_schema = model_schema["schema"]
+        if model_schema["type"] == "model" and cls.__sqlmodel_relationships__:
+            # Relationships remain ORM inputs, not Pydantic model fields.
+            # Insert below before/wrap validators so their normalized input
+            # reaches both field validation and relationship delivery.
+            parent = model_schema
+            fields_schema = parent["schema"]
+            while (
+                fields_schema["type"] == "function-before"
+                or fields_schema["type"] == "function-after"
+                or fields_schema["type"] == "function-wrap"
+            ):
+                parent = fields_schema
+                fields_schema = parent["schema"]
+            parent["schema"] = core_schema.no_info_wrap_validator_function(
+                cls._validate_fields_with_relationships, fields_schema
+            )
+        return schema
+
+    @classmethod
+    def _validate_fields_with_relationships(
+        cls, value: Any, handler: core_schema.ValidatorFunctionWrapHandler
+    ) -> tuple[builtins.dict[str, Any], builtins.dict[str, Any] | None, set[str]]:
+        """Preserve supplied ORM objects alongside Pydantic's validated fields."""
+        relationships = {}
+        for name in cls.__sqlmodel_relationships__:
+            related = (
+                value.get(name, Undefined)
+                if isinstance(value, dict)
+                else getattr(value, name, Undefined)
+            )
+            if related is not Undefined:
+                relationships[name] = related
+        if isinstance(value, dict):
+            value = {
+                name: item for name, item in value.items() if name not in relationships
+            }
+        fields, extra, fields_set = handler(value)
+        # The dictionary proxy will deliver these objects through ORM setters.
+        # They remain excluded from Pydantic's fields and serialization.
+        fields.update(relationships)
+        return fields, extra, fields_set
+
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
+        super().__pydantic_init_subclass__(**kwargs)
+        # Wait until Pydantic has prepared model_post_init, including private attributes.
+        # Pydantic calls model_post_init from both validation and model_construct.
+        # Preserve user overrides while preparing the ORM before they run.
+        if post_init := vars(cls).get("model_post_init"):
+
+            @wraps(post_init)
+            def model_post_init(self: SQLModel, context: Any) -> None:
+                self._initialize_orm()
+                post_init(self, context)
+
+            cls.model_post_init = model_post_init  # ty: ignore[invalid-assignment]
+
+    def model_post_init(self, context: Any) -> None:
+        self._initialize_orm()
+
+    def _initialize_orm(self) -> None:
+        """Deliver prepared fields through SQLAlchemy's native constructor."""
+        # Direct construction already ran SQLAlchemy's constructor. Validation
+        # and model_construct allocate through __new__ and still need it.
+        if (
+            is_table_model_class(type(self))
+            and "_sa_instance_state" not in self.__dict__
+        ):
+            values = self.__dict__.copy()
+            self.__dict__.clear()
+            token = instance_from_fields.set(self)
+            try:
+                type(self).__init__(self, **values)
+            finally:
+                instance_from_fields.reset(token)
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name in {"_sa_instance_state"}:
+        if name == "_sa_instance_state":
             self.__dict__[name] = value
             return
-        else:
-            # Set in SQLAlchemy, before Pydantic to trigger events and updates
-            if is_table_model_class(self.__class__) and is_instrumented(self, name):
-                set_attribute(self, name, value)
-            # Set in Pydantic model to trigger possible validation changes, only for
-            # non relationship values
-            if name not in self.__sqlmodel_relationships__:
+        if is_table_model_class(type(self)) and is_instrumented(self, name):
+            if name not in self.__sqlmodel_relationships__ and self.model_config.get(
+                "validate_assignment"
+            ):
+                previous = self.__dict__.get(name, Undefined)
                 super().__setattr__(name, value)
+                # The proxy delivers changed values. An explicit assignment of
+                # the same value must still trigger SQLAlchemy's setter once.
+                if self.__dict__[name] is previous:
+                    set_attribute(self, name, previous)
+                return
+            set_attribute(self, name, value)
+        # Relationships belong to SQLAlchemy; Pydantic manages other attributes.
+        if name not in self.__sqlmodel_relationships__:
+            super().__setattr__(name, value)
+
+    def __setstate__(self, state: builtins.dict[Any, Any]) -> None:
+        # Restoration replaces all attributes. Clear the old dictionary so the
+        # proxy does not interpret restored fields as changes to an existing object.
+        if state.get("__dict__") is not self.__dict__:
+            self.__dict__.clear()
+        super().__setstate__(state)
+
+    def __deepcopy__(
+        self: _TSQLModel, memo: builtins.dict[int, Any] | None = None
+    ) -> _TSQLModel:
+        """Keep ORM back-references attached to the copied instance."""
+        if not is_table_model_class(type(self)):
+            return super().__deepcopy__(memo)
+        memo = {} if memo is None else memo
+        copied = type(self).__new__(type(self))
+        # ORM state points back to its owner. Register the copy before following
+        # that reference, so it resolves to this instance instead of another copy.
+        memo[id(self)] = copied
+        copied.__setstate__(deepcopy(self.__getstate__(), memo))
+        return copied
 
     def __repr_args__(self) -> Sequence[tuple[str | None, Any]]:
         # Don't show SQLAlchemy private attributes
@@ -917,13 +1038,19 @@ class SQLModel(BaseModel, metaclass=SQLModelMetaclass, registry=default_registry
         context: builtins.dict[str, Any] | None = None,
         update: builtins.dict[str, Any] | None = None,
     ) -> _TSQLModel:
-        return sqlmodel_validate(
-            cls=cls,
-            obj=obj,
+        # Keep SQLModel's update argument and conversion to the requested class.
+        # Pydantic owns instance validation.
+        if update or isinstance(obj, cls):
+            obj = (
+                {**obj, **(update or {})}
+                if isinstance(obj, dict)
+                else ObjectWithUpdateWrapper(obj=obj, update=update or {})
+            )
+        return super().model_validate(
+            obj,
             strict=strict,
             from_attributes=from_attributes,
             context=context,
-            update=update,
         )
 
     def model_dump(

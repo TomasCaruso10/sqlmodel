@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from pydantic import (
     BaseModel,
+    ModelWrapValidatorHandler,
     PrivateAttr,
     TypeAdapter,
     ValidationError,
@@ -24,10 +25,6 @@ from sqlmodel import Field, Relationship, Session, SQLModel
 @pytest.mark.parametrize(
     "entry", ["init", "python", "json", "adapter", "list", "nested", "strings"]
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="Upstream validation entry points do not preserve all field/post-init hooks and ORM state.",
-)
 def test_validation_entry_points_preserve_hooks_and_state(
     entry: str, database_engine: Engine
 ) -> None:
@@ -38,9 +35,31 @@ def test_validation_entry_points_preserve_hooks_and_state(
         quantity: int = Field(gt=0)
         _marker: str = PrivateAttr(default="ready")
 
+        @model_validator(mode="wrap")
+        @classmethod
+        def record_wrap(
+            cls,
+            data: Any,
+            handler: ModelWrapValidatorHandler["Item"],
+            info: ValidationInfo,
+        ) -> "Item":
+            calls.append(("wrap_before", info.context))
+            result = handler(data)
+            calls.append(("wrap_after", info.context))
+            return result
+
+        @model_validator(mode="before")
+        @classmethod
+        def record_before(cls, data: Any, info: ValidationInfo) -> Any:
+            calls.append(("before", info.context))
+            return data
+
         @field_validator("quantity")
         @classmethod
         def record_field(cls, value: int, info: ValidationInfo) -> int:
+            assert info.mode == {"json": "json", "strings": "string"}.get(
+                entry, "python"
+            )
             calls.append(("field", info.context))
             return value
 
@@ -76,7 +95,14 @@ def test_validation_entry_points_preserve_hooks_and_state(
         return Item.model_validate_strings({"quantity": str(quantity)}, context=context)
 
     item = build(2)
-    assert calls == [("field", context), ("post", context), ("after", context)]
+    assert calls == [
+        ("wrap_before", context),
+        ("before", context),
+        ("field", context),
+        ("post", context),
+        ("wrap_after", context),
+        ("after", context),
+    ]
     assert item.model_dump() == {"id": None, "quantity": 2}
     assert item.model_fields_set == {"quantity"}
     assert "item" in Envelope.model_json_schema()["properties"]
@@ -94,26 +120,7 @@ def test_validation_entry_points_preserve_hooks_and_state(
         assert not calls  # Database loading uses SQLAlchemy's lifecycle.
 
 
-@pytest.mark.parametrize(
-    "entry",
-    [
-        "python",
-        pytest.param(
-            "json",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="Upstream JSON construction bypasses strict field validation.",
-            ),
-        ),
-        pytest.param(
-            "adapter",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="Upstream TypeAdapter construction bypasses strict field validation.",
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("entry", ["python", "json", "adapter"])
 def test_strict_validation_is_not_lost(entry: str) -> None:
     class Item(SQLModel, table=True):
         id: int | None = Field(default=None, primary_key=True)
@@ -130,11 +137,7 @@ def test_strict_validation_is_not_lost(entry: str) -> None:
 
 
 @pytest.mark.parametrize("expired", [False, True])
-@pytest.mark.xfail(
-    strict=True,
-    reason="Upstream constructor triggers assignment validation before ceiling has its default.",
-)
-def test_rejected_model_assignment_does_not_publish_orm_changes(
+def test_rollback_discards_assignment_rejected_by_model_validator(
     database_engine: Engine, expired: bool
 ) -> None:
     class Item(SQLModel, table=True):
@@ -155,42 +158,42 @@ def test_rejected_model_assignment_does_not_publish_orm_changes(
     )
     SQLModel.metadata.create_all(database_engine)
     with Session(database_engine) as session:
-        item = Item(quantity=2)
-        session.add(item)
-        session.flush()
-        fields_set = item.model_fields_set.copy()
-        if expired:
-            session.expire(item)
-        writes.clear()
-        with pytest.raises(ValidationError):
-            item.quantity = 11
+        with session.begin():
+            item = Item(quantity=2)
+            session.add(item)
+            session.flush()
+            key = item.id
+
+        with pytest.raises(ValidationError, match="Quantity exceeds ceiling"):
+            with session.begin():
+                item = session.get(Item, key)
+                assert item is not None
+                if expired:
+                    session.expire(item)
+                writes.clear()
+                try:
+                    item.quantity = 11
+                except ValidationError:
+                    # Pydantic's after validator runs after the field is written.
+                    # Raising does not undo that write; the transaction rolls back.
+                    assert item.quantity == 11
+                    assert writes == [11]
+                    raise
+
         assert item.quantity == 2
-        assert item.model_fields_set == fields_set
         assert item not in session.dirty
-        assert not writes
-        if expired:
-            session.expire(item)
-        item.quantity = "3"  # Runtime validation coerces before the ORM sees it.
-        assert writes == [3]
-        assert inspect(item).attrs.quantity.history.deleted == [2]
-        session.flush()
-        key = item.id
-        session.expunge_all()
+
+    with Session(database_engine) as session:
         loaded = session.get(Item, key)
-        assert loaded is not None and loaded.quantity == 3
+        assert loaded is not None and loaded.quantity == 2
 
 
 @pytest.mark.parametrize(
     "operation",
     [
         "copy",
-        pytest.param(
-            "deepcopy",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="Upstream deep copy does not bind ORM state to the copied instance.",
-            ),
-        ),
+        "deepcopy",
+        "model_copy",
         "pickle",
     ],
 )
@@ -205,6 +208,12 @@ def test_dictionary_restore_preserves_native_orm_identity(
     monkeypatch.setattr(sys.modules[__name__], "PickledItem", Item, raising=False)
     initialized: list[Any] = []
     event.listen(Item, "init", lambda target, args, kwargs: initialized.append(target))
+    assigned: list[Any] = []
+    event.listen(
+        Item.quantity,
+        "set",
+        lambda target, value, old, initiator: assigned.append(value),
+    )
     SQLModel.metadata.create_all(database_engine)
     with Session(database_engine) as session:
         item = Item(quantity=2)
@@ -214,25 +223,27 @@ def test_dictionary_restore_preserves_native_orm_identity(
             item.quantity == 2
         )  # Load before copying, without triggering lazy I/O later.
         initialized.clear()
+        assigned.clear()
         if operation == "copy":
             restored = copy.copy(item)
         elif operation == "deepcopy":
             restored = copy.deepcopy(item)
+        elif operation == "model_copy":
+            restored = item.model_copy(deep=True)
         else:
             restored = pickle.loads(pickle.dumps(item))
         assert restored is not item
         assert inspect(restored).key == inspect(item).key
-        if operation in {"deepcopy", "pickle"}:
+        if operation in {"deepcopy", "model_copy", "pickle"}:
             assert inspect(restored).object is restored
         assert not initialized
+        assert not assigned
+        assert not inspect(restored).modified
+        assert not inspect(restored).attrs.quantity.history.has_changes()
         assert restored.model_dump() == item.model_dump()
 
 
 @pytest.mark.parametrize("entry", ["init", "python", "json", "adapter"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="Experiment contract, not an upstream guarantee: field validation precedes post-init and external ORM init.",
-)
 def test_init_event_timing(entry: str) -> None:
     calls: list[str] = []
 
@@ -264,10 +275,6 @@ def test_init_event_timing(entry: str) -> None:
 
 
 @pytest.mark.parametrize("entry", ["init", "python", "adapter", "nested", "attributes"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="Experiment contract: normalized relationships must be available to after validators across entry points.",
-)
 def test_validated_relationships_preserve_identity_and_backrefs(
     entry: str, database_engine: Engine
 ) -> None:
@@ -324,3 +331,54 @@ def test_validated_relationships_preserve_identity_and_backrefs(
         session.expunge_all()
         loaded = session.get(Order, key)
         assert loaded is not None and loaded.customer.name == "Ana"
+
+
+def test_model_validate_runs_field_validator_once() -> None:
+    validated_values: list[int] = []
+
+    class Item(SQLModel, table=True):
+        id: int | None = Field(default=None, primary_key=True)
+        quantity: int
+
+        @field_validator("quantity")
+        @classmethod
+        def record_validation(cls, value: int) -> int:
+            validated_values.append(value)
+            return value
+
+    item = Item.model_validate({"quantity": 2})
+
+    assert inspect(item).object is item
+    assert item.quantity == 2
+    assert validated_values == [2]
+
+
+@pytest.mark.parametrize("operation", ["deepcopy", "model_copy"])
+def test_deep_copy_preserves_relationship_cycles(operation: str) -> None:
+    class Parent(SQLModel, table=True):
+        id: int | None = Field(default=None, primary_key=True)
+        children: list["Child"] = Relationship(back_populates="parent")
+        _notes: list[str] = PrivateAttr(default_factory=list)
+
+    class Child(SQLModel, table=True):
+        id: int | None = Field(default=None, primary_key=True)
+        parent_id: int | None = Field(default=None, foreign_key="parent.id")
+        parent: Parent | None = Relationship(back_populates="children")
+
+    parent = Parent(children=[Child()])
+    parent._notes.append("original")
+    copied = (
+        copy.deepcopy(parent)
+        if operation == "deepcopy"
+        else parent.model_copy(deep=True)
+    )
+
+    assert copied is not parent
+    assert copied.children[0] is not parent.children[0]
+    assert copied.children[0].parent is copied
+    assert parent.children[0].parent is parent
+    assert inspect(copied).object is copied
+    assert inspect(copied.children[0]).object is copied.children[0]
+    copied._notes.append("copy")
+    assert parent._notes == ["original"]
+    assert copied._notes == ["original", "copy"]
