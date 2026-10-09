@@ -4,7 +4,7 @@ from sqlalchemy import Engine
 from sqlmodel import Field, Session, SQLModel, select
 
 
-def test_allow_instantiation_without_arguments(database_engine: Engine):
+def test_allow_partial_instantiation_with_model_construct(database_engine: Engine):
     class Item(SQLModel, table=True):
         id: int | None = Field(default=None, primary_key=True)
         name: str
@@ -13,7 +13,7 @@ def test_allow_instantiation_without_arguments(database_engine: Engine):
     engine = database_engine
     SQLModel.metadata.create_all(engine)
     with Session(engine) as db:
-        item = Item()
+        item = Item.model_construct()
         item.name = "Rick"
         db.add(item)
         db.commit()
