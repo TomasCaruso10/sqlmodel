@@ -18,12 +18,10 @@ from typing import (
 
 from pydantic import BaseModel, GetCoreSchemaHandler
 from pydantic_core import CoreSchema, core_schema
-from sqlalchemy import inspect
 from sqlalchemy.orm import (
     Mapped,
     declared_attr,
     registry,
-    relationship,
 )
 from sqlalchemy.orm.attributes import set_attribute
 from sqlalchemy.orm.decl_api import DeclarativeMeta
@@ -206,29 +204,7 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
                     # handled well by SQLAlchemy without Mapped, so, wrap the
                     # annotations in Mapped here
                     cls.__annotations__[rel_name] = Mapped[ann]
-                relationship_to = rel_info.resolve_target(ann)
-                rel_kwargs: dict[str, Any] = {}
-                if rel_info.back_populates:
-                    rel_kwargs["back_populates"] = rel_info.back_populates
-                if rel_info.cascade_delete:
-                    rel_kwargs["cascade"] = "all, delete-orphan"
-                if rel_info.passive_deletes:
-                    rel_kwargs["passive_deletes"] = rel_info.passive_deletes
-                if rel_info.link_model:
-                    ins = inspect(rel_info.link_model)
-                    local_table = getattr(ins, "local_table")  # noqa: B009
-                    if local_table is None:
-                        raise RuntimeError(
-                            "Couldn't find the secondary table for "
-                            f"model {rel_info.link_model}"
-                        )
-                    rel_kwargs["secondary"] = local_table
-                rel_args: list[Any] = []
-                if rel_info.sa_relationship_args:
-                    rel_args.extend(rel_info.sa_relationship_args)
-                if rel_info.sa_relationship_kwargs:
-                    rel_kwargs.update(rel_info.sa_relationship_kwargs)
-                rel_value = relationship(relationship_to, *rel_args, **rel_kwargs)
+                rel_value = rel_info.from_annotation(ann)
                 setattr(cls, rel_name, rel_value)  # Fix #315
             # SQLAlchemy no longer uses dict_
             # Ref: https://github.com/sqlalchemy/sqlalchemy/commit/428ea01f00a9cc7f85e435018565eb6da7af1b77

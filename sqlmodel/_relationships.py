@@ -13,7 +13,8 @@ from typing import (
 
 from pydantic import ConfigDict, model_validator
 from pydantic.dataclasses import dataclass
-from sqlalchemy.orm import RelationshipProperty
+from sqlalchemy import inspect
+from sqlalchemy.orm import RelationshipProperty, relationship
 from typing_extensions import Self
 
 from ._compat import Representation, _typing
@@ -51,6 +52,31 @@ class RelationshipInfo(Representation):
                     "also passing a sa_relationship"
                 )
         return self
+
+    def from_annotation(self, annotation: Any) -> RelationshipProperty[Any]:
+        """Create the native relationship using this declaration's options."""
+        target = self.resolve_target(annotation)
+        kwargs = self.relationship_kwargs()
+        kwargs.update(self.sa_relationship_kwargs or {})
+        return relationship(target, *(self.sa_relationship_args or ()), **kwargs)
+
+    def relationship_kwargs(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        if self.back_populates:
+            kwargs["back_populates"] = self.back_populates
+        if self.cascade_delete:
+            kwargs["cascade"] = "all, delete-orphan"
+        if self.passive_deletes:
+            kwargs["passive_deletes"] = self.passive_deletes
+        if self.link_model:
+            inspected = inspect(self.link_model)
+            local_table = getattr(inspected, "local_table")  # noqa: B009
+            if local_table is None:
+                raise RuntimeError(
+                    f"Couldn't find the secondary table for model {self.link_model}"
+                )
+            kwargs["secondary"] = local_table
+        return kwargs
 
     @staticmethod
     def resolve_target(annotation: Any) -> Any:
