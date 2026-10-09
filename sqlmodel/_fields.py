@@ -502,63 +502,78 @@ def get_sqlalchemy_type(field: Any) -> Any:
     raise ValueError(f"{type_} has no matching SQLAlchemy type")
 
 
+@dataclass
+class FieldMapping:
+    """Derive a SQLAlchemy column from the original Pydantic field."""
+
+    field: PydanticFieldInfo
+
+    def to_column(self) -> Column:
+        sa_column = self.option("sa_column")
+        if isinstance(sa_column, Column):
+            return sa_column
+        sa_type = get_sqlalchemy_type(self.field)
+        return Column(*self.column_args, type_=sa_type, **self.column_kwargs)
+
+    def option(self, name: str, default: Any = Undefined) -> Any:
+        value = _get_sqlmodel_field_value(self.field, name, Undefined)
+        return default if value is Undefined else value
+
+    @property
+    def primary_key(self) -> bool:
+        return self.option("primary_key", False)
+
+    @property
+    def nullable(self) -> bool:
+        # Override derived nullability if the nullable property is set explicitly
+        # on the field
+        field_nullable = self.option("nullable")
+        if field_nullable is not Undefined:
+            assert not isinstance(field_nullable, UndefinedType)
+            return field_nullable
+        return not self.primary_key and is_field_noneable(self.field)
+
+    @property
+    def column_args(self) -> list[Any]:
+        args: list[Any] = []
+        foreign_key = self.option("foreign_key", None)
+        if foreign_key:
+            ondelete_value = self.option("ondelete", None)
+            if ondelete_value == "SET NULL" and not self.nullable:
+                raise RuntimeError('ondelete="SET NULL" requires nullable=True')
+            assert isinstance(foreign_key, str)
+            assert isinstance(ondelete_value, (str, type(None)))  # for typing
+            args.append(ForeignKey(foreign_key, ondelete=ondelete_value))
+        sa_column_args = self.option("sa_column_args")
+        if sa_column_args is not Undefined:
+            args.extend(list(cast(Sequence[Any], sa_column_args)))
+        return args
+
+    @property
+    def column_kwargs(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "primary_key": self.primary_key,
+            "nullable": self.nullable,
+            "index": self.option("index", False),
+            "unique": self.option("unique", False),
+        }
+        sa_default = self.default
+        if sa_default is not Undefined:
+            kwargs["default"] = sa_default
+        sa_column_kwargs = self.option("sa_column_kwargs")
+        if sa_column_kwargs is not Undefined:
+            kwargs.update(cast(dict[Any, Any], sa_column_kwargs))
+        return kwargs
+
+    @property
+    def default(self) -> Any:
+        if self.field.default_factory:
+            return self.field.default_factory
+        return self.field.default
+
+
 def get_column_from_field(field: Any) -> Column:
-    field_info = field
-    sa_column = _get_sqlmodel_field_value(field_info, "sa_column", Undefined)
-    if isinstance(sa_column, Column):
-        return sa_column
-    sa_type = get_sqlalchemy_type(field)
-    primary_key = _get_sqlmodel_field_value(field_info, "primary_key", Undefined)
-    if primary_key is Undefined:
-        primary_key = False
-    index = _get_sqlmodel_field_value(field_info, "index", Undefined)
-    if index is Undefined:
-        index = False
-    nullable = not primary_key and is_field_noneable(field)
-    # Override derived nullability if the nullable property is set explicitly
-    # on the field
-    field_nullable = _get_sqlmodel_field_value(field_info, "nullable", Undefined)
-    if field_nullable is not Undefined:
-        assert not isinstance(field_nullable, UndefinedType)
-        nullable = field_nullable
-    args = []
-    foreign_key = _get_sqlmodel_field_value(field_info, "foreign_key", Undefined)
-    if foreign_key is Undefined:
-        foreign_key = None
-    unique = _get_sqlmodel_field_value(field_info, "unique", Undefined)
-    if unique is Undefined:
-        unique = False
-    if foreign_key:
-        ondelete_value = _get_sqlmodel_field_value(field_info, "ondelete", Undefined)
-        if ondelete_value is Undefined:
-            ondelete_value = None
-        if ondelete_value == "SET NULL" and not nullable:
-            raise RuntimeError('ondelete="SET NULL" requires nullable=True')
-        assert isinstance(foreign_key, str)
-        assert isinstance(ondelete_value, (str, type(None)))  # for typing
-        args.append(ForeignKey(foreign_key, ondelete=ondelete_value))
-    kwargs: dict[str, Any] = {
-        "primary_key": primary_key,
-        "nullable": nullable,
-        "index": index,
-        "unique": unique,
-    }
-    sa_default = Undefined
-    if field_info.default_factory:
-        sa_default = field_info.default_factory
-    elif field_info.default is not Undefined:
-        sa_default = field_info.default
-    if sa_default is not Undefined:
-        kwargs["default"] = sa_default
-    sa_column_args = _get_sqlmodel_field_value(field_info, "sa_column_args", Undefined)
-    if sa_column_args is not Undefined:
-        args.extend(list(cast(Sequence[Any], sa_column_args)))
-    sa_column_kwargs = _get_sqlmodel_field_value(
-        field_info, "sa_column_kwargs", Undefined
-    )
-    if sa_column_kwargs is not Undefined:
-        kwargs.update(cast(dict[Any, Any], sa_column_kwargs))
-    return Column(*args, type_=sa_type, **kwargs)
+    return FieldMapping(field).to_column()
 
 
 def is_field_noneable(field: PydanticFieldInfo) -> bool:
