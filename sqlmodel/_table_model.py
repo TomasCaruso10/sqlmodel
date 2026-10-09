@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+from collections.abc import Callable
 from copy import deepcopy
 from functools import update_wrapper, wraps
 from typing import Any, cast, get_origin
@@ -147,13 +148,20 @@ class TableMixin(ModelMixin):
         # Preserve user overrides while preparing the ORM before they run.
         post_init = cls.model_post_init
         if post_init is not TableMixin.model_post_init:
+            cls.model_post_init = cls._with_initialized_orm(post_init)
 
-            @wraps(post_init)
-            def model_post_init(self: TableMixin, context: Any) -> None:
-                self._initialize_orm()
-                post_init(self, context)
+    @staticmethod
+    def _with_initialized_orm(
+        post_init: Callable[[TableMixin, Any], None],
+    ) -> Callable[[TableMixin, Any], None]:
+        """Prepare ORM state before running the supplied post-init hook."""
 
-            cls.model_post_init = model_post_init
+        @wraps(post_init)
+        def model_post_init(self: TableMixin, context: Any) -> None:
+            self._initialize_orm()
+            post_init(self, context)
+
+        return model_post_init
 
     def model_post_init(self, context: Any) -> None:
         self._initialize_orm()
