@@ -11,7 +11,7 @@ from typing import (
     overload,
 )
 
-from pydantic import ConfigDict, model_validator
+from pydantic import ConfigDict, Field, model_validator
 from pydantic.dataclasses import dataclass
 from sqlalchemy import inspect
 from sqlalchemy.orm import RelationshipProperty, relationship
@@ -36,7 +36,8 @@ class RelationshipInfo(Representation):
     link_model: Any | None = None
     sa_relationship: RelationshipProperty | None = None
     sa_relationship_args: Sequence[Any] | None = None
-    sa_relationship_kwargs: Mapping[str, Any] | None = None
+    # Pydantic 2.11 strict Mapping validation checks the container but skips its keys.
+    sa_relationship_kwargs: Mapping[str, Any] | None = Field(default=None, strict=False)
 
     @model_validator(mode="after")
     def validate_relationship_options(self) -> Self:
