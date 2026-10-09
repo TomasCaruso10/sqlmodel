@@ -1,16 +1,13 @@
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, overload
+from typing import Any, overload
 
 from pydantic import BaseModel
 from sqlalchemy.orm.attributes import set_attribute
 from sqlalchemy.orm.instrumentation import is_instrumented
 
-if TYPE_CHECKING:
-    from .main import SQLModel
-
 # Only this instance is receiving prepared fields without running validation.
-instance_from_fields: ContextVar["SQLModel | None"] = ContextVar(
+instance_from_fields: ContextVar[BaseModel | None] = ContextVar(
     "instance_from_fields", default=None
 )
 
@@ -45,22 +42,22 @@ class InstanceDictProxy:
 
     @overload
     def __get__(
-        self, instance: None, owner: type["SQLModel"] | None = None
+        self, instance: None, owner: type[BaseModel] | None = None
     ) -> "InstanceDictProxy": ...
 
     @overload
     def __get__(
-        self, instance: "SQLModel", owner: type["SQLModel"] | None = None
+        self, instance: BaseModel, owner: type[BaseModel] | None = None
     ) -> dict[str, Any]: ...
 
     def __get__(
-        self, instance: "SQLModel | None", owner: type["SQLModel"] | None = None
+        self, instance: BaseModel | None, owner: type[BaseModel] | None = None
     ) -> Any:
         if instance is None:
             return self
         return self.storage.__get__(instance, owner)
 
-    def __set__(self, instance: "SQLModel", values: dict[str, Any]) -> None:
+    def __set__(self, instance: BaseModel, values: dict[str, Any]) -> None:
         """Deliver prepared fields without replacing SQLAlchemy's state."""
         current = self.storage.__get__(instance, type(instance))
         # Assignment keeps this instance's state in the validated dictionary.

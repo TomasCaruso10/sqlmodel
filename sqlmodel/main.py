@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import builtins
 from collections.abc import Callable, Mapping, Sequence
-from copy import deepcopy
-from functools import update_wrapper, wraps
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -13,19 +11,15 @@ from typing import (
     TypeVar,
     Union,
     cast,
-    get_origin,
 )
 
 from pydantic import BaseModel, GetCoreSchemaHandler
 from pydantic_core import CoreSchema, core_schema
 from sqlalchemy.orm import (
-    Mapped,
     declared_attr,
     registry,
 )
-from sqlalchemy.orm.attributes import set_attribute
 from sqlalchemy.orm.decl_api import DeclarativeMeta
-from sqlalchemy.orm.instrumentation import is_instrumented
 from sqlalchemy.sql.schema import MetaData
 from typing_extensions import dataclass_transform, deprecated
 
@@ -38,13 +32,9 @@ from ._compat import (
     _pydantic,
     get_annotations,
     get_model_fields,
-    init_pydantic_private_attrs,
-    is_table_model_class,
 )
 from ._construction import (
-    InstanceDictProxy,
     ObjectWithUpdateWrapper,
-    instance_from_fields,
 )
 from ._fields import MAX_ITEMS_DEPRECATION_MSG as MAX_ITEMS_DEPRECATION_MSG
 from ._fields import MIN_ITEMS_DEPRECATION_MSG as MIN_ITEMS_DEPRECATION_MSG
@@ -58,8 +48,10 @@ from ._fields import _get_sqlmodel_field_metadata as _get_sqlmodel_field_metadat
 from ._fields import _get_sqlmodel_field_value as _get_sqlmodel_field_value
 from ._fields import get_column_from_field as get_column_from_field
 from ._fields import get_sqlalchemy_type as get_sqlalchemy_type
+from ._model import ModelMixin
 from ._relationships import Relationship as Relationship
 from ._relationships import RelationshipInfo as RelationshipInfo
+from ._table_model import TableMixin
 
 if TYPE_CHECKING:
     from pydantic._internal._model_construction import ModelMetaclass as ModelMetaclass
@@ -81,16 +73,10 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
 
     # Replicate SQLAlchemy
     def __setattr__(cls, name: str, value: Any) -> None:  # ty: ignore[invalid-method-override]
-        if is_table_model_class(cls):
-            DeclarativeMeta.__setattr__(cls, name, value)
-        else:
-            super().__setattr__(name, value)
+        cast("type[SQLModel]", cls)._set_class_attribute(name, value)
 
     def __delattr__(cls, name: str) -> None:  # ty: ignore[invalid-method-override]
-        if is_table_model_class(cls):
-            DeclarativeMeta.__delattr__(cls, name)
-        else:
-            super().__delattr__(name)
+        cast("type[SQLModel]", cls)._delete_class_attribute(name)
 
     # From Pydantic
     def __new__(
@@ -100,6 +86,7 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
         class_dict: dict[str, Any],
         **kwargs: Any,
     ) -> Any:
+        bases = cls._model_bases(bases, class_dict, kwargs)
         namespace, relationship_annotations = cls._prepare_pydantic_namespace(
             class_dict
         )
@@ -115,8 +102,7 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
         }
 
         config_table = cls._get_config(new_cls, "table", kwargs)
-        if config_table is True:
-            cls._configure_table(new_cls)
+        new_cls._configure_model(table=config_table is True)
 
         config_registry = cls._get_config(new_cls, "registry", kwargs)
         if config_registry is not Undefined:
@@ -124,6 +110,31 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
                 new_cls, cast(registry, config_registry), config_table
             )
         return new_cls
+
+    @staticmethod
+    def _model_bases(
+        bases: tuple[type[Any], ...],
+        class_dict: dict[str, Any],
+        kwargs: dict[str, Any],
+    ) -> tuple[type[Any], ...]:
+        """Select table behavior before Pydantic builds the class schema."""
+        config = {}
+        for base in bases:
+            config.update(getattr(base, "model_config", {}))
+        if "Config" in class_dict:
+            config["table"] = getattr(
+                class_dict["Config"], "table", config.get("table", Undefined)
+            )
+        config.update(class_dict.get("model_config", {}))
+        table = config.get("table", Undefined)
+        if table is Undefined:
+            table = kwargs.get("table", Undefined)
+        if table is not True:
+            return bases
+        if any(issubclass(base, TableMixin) for base in bases):
+            return bases
+        # User overrides stay ahead of the table integration in the MRO.
+        return (*bases, TableMixin)
 
     @staticmethod
     def _prepare_pydantic_namespace(
@@ -174,23 +185,6 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
         return kwargs.get(name, Undefined)
 
     @staticmethod
-    def _configure_table(model: type[SQLModel]) -> None:
-        # If it was passed by kwargs, ensure it's also set in config
-        model.model_config["table"] = True
-        for name, field in get_model_fields(model).items():
-            column = get_column_from_field(field)
-            setattr(model, name, column)
-        # Set a config flag to tell FastAPI that this should be read with a field
-        # in orm_mode instead of preemptively converting it to a dict.
-        # This could be done by reading model.model_config['table'] in FastAPI, but
-        # that's very specific about SQLModel, so let's have another config that
-        # other future tools based on Pydantic can use.
-        model.model_config["read_from_attributes"] = True  # ty: ignore[invalid-key]
-        # For compatibility with older versions
-        # TODO: remove this in the future
-        model.model_config["read_with_orm_mode"] = True  # ty: ignore[invalid-key]
-
-    @staticmethod
     def _configure_registry(
         model: type[SQLModel],
         config_registry: registry,
@@ -206,36 +200,7 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
     def __init__(
         cls, classname: str, bases: tuple[type, ...], dict_: dict[str, Any], **kw: Any
     ) -> None:
-        # Only one of the base classes (or the current one) should be a table model
-        # this allows FastAPI cloning a SQLModel for the response_model without
-        # trying to create a new SQLAlchemy, for a new table, with the same name, that
-        # triggers an error
-        base_is_table = any(is_table_model_class(base) for base in bases)
-        if is_table_model_class(cls) and not base_is_table:
-            for rel_name, rel_info in cls.__sqlmodel_relationships__.items():
-                if rel_info.sa_relationship:
-                    # There's a SQLAlchemy relationship declared, that takes precedence
-                    # over anything else, use that and continue with the next attribute
-                    setattr(cls, rel_name, rel_info.sa_relationship)  # Fix #315
-                    continue
-                raw_ann = cls.__annotations__[rel_name]
-                origin: Any = get_origin(raw_ann)
-                if origin is Mapped:
-                    ann = raw_ann.__args__[0]
-                else:
-                    ann = raw_ann
-                    # Plain forward references, for models not yet defined, are not
-                    # handled well by SQLAlchemy without Mapped, so, wrap the
-                    # annotations in Mapped here
-                    cls.__annotations__[rel_name] = Mapped[ann]
-                rel_value = rel_info.from_annotation(ann)
-                setattr(cls, rel_name, rel_value)  # Fix #315
-            # SQLAlchemy no longer uses dict_
-            # Ref: https://github.com/sqlalchemy/sqlalchemy/commit/428ea01f00a9cc7f85e435018565eb6da7af1b77
-            # Tag: 1.4.36
-            DeclarativeMeta.__init__(cls, classname, bases, dict_, **kw)
-        else:
-            ModelMetaclass.__init__(cls, classname, bases, dict_, **kw)
+        cast("type[SQLModel]", cls)._initialize_class(classname, bases, dict_, **kw)
 
 
 default_registry = registry()
@@ -243,41 +208,17 @@ default_registry = registry()
 _TSQLModel = TypeVar("_TSQLModel", bound="SQLModel")
 
 
-class SQLModel(BaseModel, metaclass=SQLModelMetaclass, registry=default_registry):
+class SQLModel(
+    ModelMixin, BaseModel, metaclass=SQLModelMetaclass, registry=default_registry
+):
     # SQLAlchemy needs to set weakref(s), Pydantic will set the other slots values
     __slots__ = ("__weakref__",)
-    __dict__ = InstanceDictProxy()
     __tablename__: ClassVar[str | Callable[..., str]]
     __sqlmodel_relationships__: ClassVar[builtins.dict[str, RelationshipInfo]]
     __name__: ClassVar[str]
     metadata: ClassVar[MetaData]
     __allow_unmapped__ = True  # https://docs.sqlalchemy.org/en/20/changelog/migration_20.html#migration-20-step-six
     model_config = SQLModelConfig(from_attributes=True)
-
-    # Typing spec says `__new__` returning `Any` overrides normal constructor
-    # behavior, but a missing annotation does not:
-    def __new__(cls, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
-        new_object = super().__new__(cls)
-        # SQLAlchemy doesn't call __init__ on the base class when querying from DB
-        # Ref: https://docs.sqlalchemy.org/en/14/orm/constructors.html
-        # Set __fields_set__ here, that would have been set when calling __init__
-        # in the Pydantic model so that when SQLAlchemy sets attributes that are
-        # added (e.g. when querying from DB) to the __fields_set__, this already exists
-        init_pydantic_private_attrs(new_object)
-        return new_object
-
-    def __init__(__pydantic_self__, /, **data: Any) -> None:
-        # Uses something other than `self` the first arg to allow "self" as a
-        # settable attribute
-        # SQLAlchemy's generated initializer does not preserve positional-only args.
-        if instance_from_fields.get() is __pydantic_self__:
-            # SQLAlchemy has prepared its state; deliver fields without validating again.
-            __pydantic_self__.__dict__ = data
-        else:
-            super().__init__(**data)
-
-    # Preserve Pydantic's initializer marker without changing its static signature.
-    update_wrapper(__init__, BaseModel.__init__)
 
     @classmethod
     def __get_pydantic_core_schema__(
@@ -323,81 +264,6 @@ class SQLModel(BaseModel, metaclass=SQLModelMetaclass, registry=default_registry
         # They remain excluded from Pydantic's fields and serialization.
         fields.update(relationships)
         return fields, extra, fields_set
-
-    @classmethod
-    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
-        super().__pydantic_init_subclass__(**kwargs)
-        # Wait until Pydantic has prepared model_post_init, including private attributes.
-        # Pydantic calls model_post_init from both validation and model_construct.
-        # Preserve user overrides while preparing the ORM before they run.
-        if post_init := vars(cls).get("model_post_init"):
-
-            @wraps(post_init)
-            def model_post_init(self: SQLModel, context: Any) -> None:
-                self._initialize_orm()
-                post_init(self, context)
-
-            cls.model_post_init = model_post_init  # ty: ignore[invalid-assignment]
-
-    def model_post_init(self, context: Any) -> None:
-        self._initialize_orm()
-
-    def _initialize_orm(self) -> None:
-        """Deliver prepared fields through SQLAlchemy's native constructor."""
-        # Direct construction already ran SQLAlchemy's constructor. Validation
-        # and model_construct allocate through __new__ and still need it.
-        if (
-            is_table_model_class(type(self))
-            and "_sa_instance_state" not in self.__dict__
-        ):
-            values = self.__dict__.copy()
-            self.__dict__.clear()
-            token = instance_from_fields.set(self)
-            try:
-                type(self).__init__(self, **values)
-            finally:
-                instance_from_fields.reset(token)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        if name == "_sa_instance_state":
-            self.__dict__[name] = value
-            return
-        if is_table_model_class(type(self)) and is_instrumented(self, name):
-            if name not in self.__sqlmodel_relationships__ and self.model_config.get(
-                "validate_assignment"
-            ):
-                previous = self.__dict__.get(name, Undefined)
-                super().__setattr__(name, value)
-                # The proxy delivers changed values. An explicit assignment of
-                # the same value must still trigger SQLAlchemy's setter once.
-                if self.__dict__[name] is previous:
-                    set_attribute(self, name, previous)
-                return
-            set_attribute(self, name, value)
-        # Relationships belong to SQLAlchemy; Pydantic manages other attributes.
-        if name not in self.__sqlmodel_relationships__:
-            super().__setattr__(name, value)
-
-    def __setstate__(self, state: builtins.dict[Any, Any]) -> None:
-        # Restoration replaces all attributes. Clear the old dictionary so the
-        # proxy does not interpret restored fields as changes to an existing object.
-        if state.get("__dict__") is not self.__dict__:
-            self.__dict__.clear()
-        super().__setstate__(state)
-
-    def __deepcopy__(
-        self: _TSQLModel, memo: builtins.dict[int, Any] | None = None
-    ) -> _TSQLModel:
-        """Keep ORM back-references attached to the copied instance."""
-        if not is_table_model_class(type(self)):
-            return super().__deepcopy__(memo)
-        memo = {} if memo is None else memo
-        copied = type(self).__new__(type(self))
-        # ORM state points back to its owner. Register the copy before following
-        # that reference, so it resolves to this instance instead of another copy.
-        memo[id(self)] = copied
-        copied.__setstate__(deepcopy(self.__getstate__(), memo))
-        return copied
 
     def __repr_args__(self) -> Sequence[tuple[str | None, Any]]:
         # Don't show SQLAlchemy private attributes

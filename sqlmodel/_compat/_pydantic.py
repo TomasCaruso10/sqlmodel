@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from annotated_types import MaxLen
 from pydantic import VERSION as P_VERSION
@@ -16,9 +16,6 @@ from pydantic_core import (
 )
 
 from ._typing import InstanceOrType
-
-if TYPE_CHECKING:
-    from ..main import SQLModel
 
 BaseConfig = ConfigDict
 Undefined = PydanticUndefined
@@ -43,7 +40,7 @@ def get_model_fields(model: InstanceOrType[BaseModel]) -> dict[str, "FieldInfo"]
     return use_model.model_fields
 
 
-def init_pydantic_private_attrs(new_object: InstanceOrType["SQLModel"]) -> None:
+def init_pydantic_private_attrs(new_object: InstanceOrType[BaseModel]) -> None:
     object.__setattr__(new_object, "__pydantic_fields_set__", set())
     object.__setattr__(new_object, "__pydantic_extra__", None)
     object.__setattr__(new_object, "__pydantic_private__", None)
