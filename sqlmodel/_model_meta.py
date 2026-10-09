@@ -12,10 +12,10 @@ from ._compat import (
     ModelMetaclass,
     SQLModelConfig,
     Undefined,
-    get_annotations,
 )
 from ._fields import Field, FieldInfo
 from ._model_config import ModelConfig
+from ._model_namespace import ModelNamespace
 from ._relationships import RelationshipInfo
 from ._table_model import TableMixin
 
@@ -48,19 +48,19 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
         **kwargs: Any,
     ) -> Any:
         config = ModelConfig.from_declaration(bases, class_dict, kwargs)
+        namespace = ModelNamespace.from_declaration(class_dict)
         bases = cls._model_bases(bases, config)
-        namespace, relationship_annotations = cls._prepare_pydantic_namespace(
-            class_dict
-        )
         new_cls = cast(
             "type[SQLModel]",
-            super().__new__(cls, name, bases, namespace, **config.pydantic_kwargs),
+            super().__new__(
+                cls,
+                name,
+                bases,
+                namespace.pydantic_namespace,
+                **config.pydantic_kwargs,
+            ),
         )
-        new_cls.__annotations__ = {
-            **relationship_annotations,
-            **namespace["__annotations__"],
-            **new_cls.__annotations__,
-        }
+        new_cls.__annotations__ = namespace.annotations_for(new_cls)
 
         config = config.with_model_config(new_cls.model_config)
         config_table = config.table
@@ -85,33 +85,6 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
             return bases
         # User overrides stay ahead of the table integration in the MRO.
         return (*bases, TableMixin)
-
-    @staticmethod
-    def _prepare_pydantic_namespace(
-        class_dict: dict[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        relationships: dict[str, RelationshipInfo] = {}
-        dict_for_pydantic = {}
-        original_annotations = get_annotations(class_dict)
-        pydantic_annotations = {}
-        relationship_annotations = {}
-        for k, v in class_dict.items():
-            if isinstance(v, RelationshipInfo):
-                relationships[k] = v
-            else:
-                dict_for_pydantic[k] = v
-        for k, v in original_annotations.items():
-            if k in relationships:
-                relationship_annotations[k] = v
-            else:
-                pydantic_annotations[k] = v
-        namespace = {
-            **dict_for_pydantic,
-            "__weakref__": None,
-            "__sqlmodel_relationships__": relationships,
-            "__annotations__": pydantic_annotations,
-        }
-        return namespace, relationship_annotations
 
     @staticmethod
     def _configure_registry(
