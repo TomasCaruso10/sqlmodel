@@ -61,7 +61,6 @@ from ._fields import get_column_from_field as get_column_from_field
 from ._fields import get_sqlalchemy_type as get_sqlalchemy_type
 from ._relationships import Relationship as Relationship
 from ._relationships import RelationshipInfo as RelationshipInfo
-from ._relationships import get_relationship_to
 
 if TYPE_CHECKING:
     from pydantic._internal._model_construction import ModelMetaclass as ModelMetaclass
@@ -207,9 +206,7 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
                     # handled well by SQLAlchemy without Mapped, so, wrap the
                     # annotations in Mapped here
                     cls.__annotations__[rel_name] = Mapped[ann]
-                relationship_to = get_relationship_to(
-                    name=rel_name, rel_info=rel_info, annotation=ann
-                )
+                relationship_to = rel_info.resolve_target(ann)
                 rel_kwargs: dict[str, Any] = {}
                 if rel_info.back_populates:
                     rel_kwargs["back_populates"] = rel_info.back_populates
