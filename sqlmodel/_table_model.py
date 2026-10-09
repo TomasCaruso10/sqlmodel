@@ -20,7 +20,11 @@ from ._compat import (
     init_pydantic_private_attrs,
     is_table_model_class,
 )
-from ._construction import InstanceDictProxy, instance_from_fields
+from ._construction import (
+    InstanceDictProxy,
+    initializing_from_fields,
+    instance_from_fields,
+)
 from ._fields import get_column_from_field
 from ._model import ModelMixin
 
@@ -157,19 +161,22 @@ class TableMixin(ModelMixin):
 
     def _initialize_orm(self) -> None:
         """Deliver prepared fields through SQLAlchemy's native constructor."""
+        if not self._needs_orm_initialization:
+            return
+
+        values = self.__dict__.copy()
+        self.__dict__.clear()
+        with initializing_from_fields(self):
+            type(self).__init__(self, **values)
+
+    @property
+    def _needs_orm_initialization(self) -> bool:
         # Direct construction already ran SQLAlchemy's constructor. Validation
         # and model_construct allocate through __new__ and still need it.
-        if (
+        return (
             is_table_model_class(type(self))
             and "_sa_instance_state" not in self.__dict__
-        ):
-            values = self.__dict__.copy()
-            self.__dict__.clear()
-            token = instance_from_fields.set(self)
-            try:
-                type(self).__init__(self, **values)
-            finally:
-                instance_from_fields.reset(token)
+        )
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name == "_sa_instance_state":

@@ -1,3 +1,5 @@
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, overload
@@ -10,6 +12,16 @@ from sqlalchemy.orm.instrumentation import is_instrumented
 instance_from_fields: ContextVar[BaseModel | None] = ContextVar(
     "instance_from_fields", default=None
 )
+
+
+@contextmanager
+def initializing_from_fields(instance: BaseModel) -> Iterator[None]:
+    """Mark this instance as receiving prepared fields during initialization."""
+    token = instance_from_fields.set(instance)
+    try:
+        yield
+    finally:
+        instance_from_fields.reset(token)
 
 
 @dataclass
