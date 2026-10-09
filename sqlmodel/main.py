@@ -34,17 +34,18 @@ from typing_extensions import dataclass_transform, deprecated
 from ._compat import (
     PYDANTIC_MINOR_VERSION,
     BaseConfig,
-    InstanceDictProxy,
     ModelMetaclass,
-    ObjectWithUpdateWrapper,
     SQLModelConfig,
     Undefined,
     get_annotations,
     get_model_fields,
-    get_relationship_to,
     init_pydantic_private_attrs,
-    instance_from_fields,
     is_table_model_class,
+)
+from ._construction import (
+    InstanceDictProxy,
+    ObjectWithUpdateWrapper,
+    instance_from_fields,
 )
 from ._fields import MAX_ITEMS_DEPRECATION_MSG as MAX_ITEMS_DEPRECATION_MSG
 from ._fields import MIN_ITEMS_DEPRECATION_MSG as MIN_ITEMS_DEPRECATION_MSG
@@ -60,6 +61,7 @@ from ._fields import get_column_from_field as get_column_from_field
 from ._fields import get_sqlalchemy_type as get_sqlalchemy_type
 from ._relationships import Relationship as Relationship
 from ._relationships import RelationshipInfo as RelationshipInfo
+from ._relationships import get_relationship_to
 
 if TYPE_CHECKING:
     from pydantic._internal._model_construction import ModelMetaclass as ModelMetaclass

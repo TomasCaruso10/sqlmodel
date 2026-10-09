@@ -16,6 +16,8 @@ from typing import (
     Literal,
     TypeAlias,
     cast,
+    get_args,
+    get_origin,
     overload,
 )
 
@@ -43,11 +45,11 @@ from sqlalchemy.types import TypeEngine
 from typing_extensions import deprecated
 
 from ._compat import (
+    NoneType,
     Undefined,
     UndefinedType,
+    _is_union_type,
     get_field_metadata,
-    get_sa_type_from_field,
-    is_field_noneable,
 )
 from .sql.sqltypes import AutoString, UTCDateTime
 
@@ -557,3 +559,55 @@ def get_column_from_field(field: Any) -> Column:
     if sa_column_kwargs is not Undefined:
         kwargs.update(cast(dict[Any, Any], sa_column_kwargs))
     return Column(*args, type_=sa_type, **kwargs)
+
+
+def is_field_noneable(field: PydanticFieldInfo) -> bool:
+    if getattr(field, "nullable", Undefined) is not Undefined:
+        return field.nullable  # type: ignore
+    origin = get_origin(field.annotation)
+    if origin is not None and _is_union_type(origin):
+        args = get_args(field.annotation)
+        if any(arg is NoneType for arg in args):
+            return True
+    if not field.is_required():
+        if field.default is Undefined:
+            return False
+        if field.annotation is None or field.annotation is NoneType:
+            return True
+        return False
+    return False
+
+
+def get_sa_type_from_type_annotation(annotation: Any) -> Any:
+    # Resolve Optional fields
+    if annotation is None:
+        raise ValueError("Missing field type")
+    origin = get_origin(annotation)
+    if origin is None:
+        return annotation
+    elif origin is Annotated:
+        type_, *metadata = get_args(annotation)
+        type_ = get_sa_type_from_type_annotation(type_)
+        # Like Pydantic, apply the last timezone constraint in Annotated.
+        for meta in metadata:
+            if meta is AwareDatetime or isinstance(meta, cast(type, AwareDatetime)):
+                type_ = AwareDatetime
+            elif meta is NaiveDatetime or isinstance(meta, cast(type, NaiveDatetime)):
+                type_ = NaiveDatetime
+        return type_
+    if _is_union_type(origin):
+        bases = get_args(annotation)
+        if len(bases) > 2:
+            raise ValueError("Cannot have a (non-optional) union as a SQLAlchemy field")
+        # Non-optional unions are not allowed
+        if bases[0] is not NoneType and bases[1] is not NoneType:
+            raise ValueError("Cannot have a (non-optional) union as a SQLAlchemy field")
+        # Optional unions are allowed
+        use_type = bases[0] if bases[0] is not NoneType else bases[1]
+        return get_sa_type_from_type_annotation(use_type)
+    return origin
+
+
+def get_sa_type_from_field(field: Any) -> Any:
+    type_: Any = field.rebuild_annotation()
+    return get_sa_type_from_type_annotation(type_)

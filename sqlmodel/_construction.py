@@ -1,0 +1,80 @@
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, overload
+
+from pydantic import BaseModel
+from sqlalchemy.orm.attributes import set_attribute
+from sqlalchemy.orm.instrumentation import is_instrumented
+
+if TYPE_CHECKING:
+    from .main import SQLModel
+
+# Only this instance is receiving prepared fields without running validation.
+instance_from_fields: ContextVar["SQLModel | None"] = ContextVar(
+    "instance_from_fields", default=None
+)
+
+
+@dataclass
+class ObjectWithUpdateWrapper:
+    obj: Any
+    update: dict[str, Any]
+
+    def __getattribute__(self, __name: str) -> Any:
+        # Do not masquerade as the wrapped model: Pydantic must read attributes
+        # instead of returning this wrapper as an already validated instance.
+        if __name == "__class__":
+            return type(self)
+        update = super().__getattribute__("update")
+        obj = super().__getattribute__("obj")
+        if __name in update:
+            return update[__name]
+        return getattr(obj, __name)
+
+
+class InstanceDictProxy:
+    """Preserve ORM state when Pydantic replaces an instance's dictionary.
+
+    An instrumented instance keeps its existing dictionary. Prepared mapped
+    values go through SQLAlchemy's setters so it can track changes and backrefs.
+    Plain Pydantic instances and dictionary restoration keep normal behavior.
+    """
+
+    def __init__(self) -> None:
+        self.storage = BaseModel.__dict__["__dict__"]
+
+    @overload
+    def __get__(
+        self, instance: None, owner: type["SQLModel"] | None = None
+    ) -> "InstanceDictProxy": ...
+
+    @overload
+    def __get__(
+        self, instance: "SQLModel", owner: type["SQLModel"] | None = None
+    ) -> dict[str, Any]: ...
+
+    def __get__(
+        self, instance: "SQLModel | None", owner: type["SQLModel"] | None = None
+    ) -> Any:
+        if instance is None:
+            return self
+        return self.storage.__get__(instance, owner)
+
+    def __set__(self, instance: "SQLModel", values: dict[str, Any]) -> None:
+        """Deliver prepared fields without replacing SQLAlchemy's state."""
+        current = self.storage.__get__(instance, type(instance))
+        # Assignment keeps this instance's state in the validated dictionary.
+        # A different state belongs to a dictionary restoration, not an assignment.
+        if "_sa_instance_state" not in current or (
+            "_sa_instance_state" in values
+            and values["_sa_instance_state"] is not current["_sa_instance_state"]
+        ):
+            self.storage.__set__(instance, values)
+            return
+        for name, value in values.items():
+            if name in current and current[name] is value:
+                continue
+            if is_instrumented(instance, name):
+                set_attribute(instance, name, value)
+            else:
+                current[name] = value
