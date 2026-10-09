@@ -1,20 +1,11 @@
 from __future__ import annotations
 
 import builtins
-import ipaddress
-import uuid
-import warnings
-from collections.abc import Callable, Mapping, Sequence, Set
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
-from decimal import Decimal
-from enum import Enum
 from functools import update_wrapper, wraps
-from pathlib import Path
 from typing import (
     TYPE_CHECKING,
-    Annotated,
     Any,
     ClassVar,
     Literal,
@@ -23,35 +14,13 @@ from typing import (
     Union,
     cast,
     get_origin,
-    overload,
 )
 
-from pydantic import (
-    AwareDatetime,
-    BaseModel,
-    Discriminator,
-    EmailStr,
-    GetCoreSchemaHandler,
-    NaiveDatetime,
-)
-from pydantic.fields import FieldInfo as PydanticFieldInfo
+from pydantic import BaseModel, GetCoreSchemaHandler
 from pydantic_core import CoreSchema, core_schema
-from sqlalchemy import (
-    Boolean,
-    Column,
-    Date,
-    DateTime,
-    Float,
-    ForeignKey,
-    Integer,
-    Interval,
-    Numeric,
-    inspect,
-)
-from sqlalchemy import Enum as sa_Enum
+from sqlalchemy import inspect
 from sqlalchemy.orm import (
     Mapped,
-    RelationshipProperty,
     declared_attr,
     registry,
     relationship,
@@ -60,8 +29,6 @@ from sqlalchemy.orm.attributes import set_attribute
 from sqlalchemy.orm.decl_api import DeclarativeMeta
 from sqlalchemy.orm.instrumentation import is_instrumented
 from sqlalchemy.sql.schema import MetaData
-from sqlalchemy.sql.sqltypes import LargeBinary, Time, Uuid
-from sqlalchemy.types import TypeEngine
 from typing_extensions import dataclass_transform, deprecated
 
 from ._compat import (
@@ -70,498 +37,40 @@ from ._compat import (
     InstanceDictProxy,
     ModelMetaclass,
     ObjectWithUpdateWrapper,
-    Representation,
     SQLModelConfig,
     Undefined,
-    UndefinedType,
     get_annotations,
-    get_field_metadata,
     get_model_fields,
     get_relationship_to,
-    get_sa_type_from_field,
     init_pydantic_private_attrs,
     instance_from_fields,
-    is_field_noneable,
     is_table_model_class,
 )
-from .sql.sqltypes import AutoString, UTCDateTime
+from ._fields import MAX_ITEMS_DEPRECATION_MSG as MAX_ITEMS_DEPRECATION_MSG
+from ._fields import MIN_ITEMS_DEPRECATION_MSG as MIN_ITEMS_DEPRECATION_MSG
+from ._fields import Field as Field
+from ._fields import FieldInfo as FieldInfo
+from ._fields import FieldInfoMetadata as FieldInfoMetadata
+from ._fields import NoArgAnyCallable as NoArgAnyCallable
+from ._fields import OnDeleteType as OnDeleteType
+from ._fields import SaTypeOrInstance as SaTypeOrInstance
+from ._fields import _get_sqlmodel_field_metadata as _get_sqlmodel_field_metadata
+from ._fields import _get_sqlmodel_field_value as _get_sqlmodel_field_value
+from ._fields import get_column_from_field as get_column_from_field
+from ._fields import get_sqlalchemy_type as get_sqlalchemy_type
+from ._relationships import Relationship as Relationship
+from ._relationships import RelationshipInfo as RelationshipInfo
 
 if TYPE_CHECKING:
     from pydantic._internal._model_construction import ModelMetaclass as ModelMetaclass
-    from pydantic._internal._repr import Representation as Representation
     from pydantic_core import PydanticUndefined as Undefined
-    from pydantic_core import PydanticUndefinedType as UndefinedType
 
-NoArgAnyCallable = Callable[[], Any]
 IncEx: TypeAlias = (
     set[int]
     | set[str]
     | Mapping[int, Union["IncEx", bool]]
     | Mapping[str, Union["IncEx", bool]]
 )
-SaTypeOrInstance: TypeAlias = TypeEngine[Any] | type[TypeEngine[Any]]
-OnDeleteType = Literal["CASCADE", "SET NULL", "RESTRICT"]
-
-MIN_ITEMS_DEPRECATION_MSG = (
-    "`min_items` is deprecated and will be removed, use `min_length` instead"
-)
-MAX_ITEMS_DEPRECATION_MSG = (
-    "`max_items` is deprecated and will be removed, use `max_length` instead"
-)
-
-
-class FieldInfo(PydanticFieldInfo):  # ty: ignore[subclass-of-final-class]
-    # mypy - ignore that PydanticFieldInfo is @final
-    def __init__(self, default: Any = Undefined, **kwargs: Any) -> None:
-        primary_key = kwargs.pop("primary_key", False)
-        nullable = kwargs.pop("nullable", Undefined)
-        foreign_key = kwargs.pop("foreign_key", Undefined)
-        ondelete = kwargs.pop("ondelete", Undefined)
-        unique = kwargs.pop("unique", False)
-        index = kwargs.pop("index", Undefined)
-        sa_type = kwargs.pop("sa_type", Undefined)
-        sa_column = kwargs.pop("sa_column", Undefined)
-        sa_column_args = kwargs.pop("sa_column_args", Undefined)
-        sa_column_kwargs = kwargs.pop("sa_column_kwargs", Undefined)
-        if sa_column is not Undefined:
-            if sa_column_args is not Undefined:
-                raise RuntimeError(
-                    "Passing sa_column_args is not supported when "
-                    "also passing a sa_column"
-                )
-            if sa_column_kwargs is not Undefined:
-                raise RuntimeError(
-                    "Passing sa_column_kwargs is not supported when "
-                    "also passing a sa_column"
-                )
-            if primary_key is not Undefined:
-                raise RuntimeError(
-                    "Passing primary_key is not supported when also passing a sa_column"
-                )
-            if nullable is not Undefined:
-                raise RuntimeError(
-                    "Passing nullable is not supported when also passing a sa_column"
-                )
-            if foreign_key is not Undefined:
-                raise RuntimeError(
-                    "Passing foreign_key is not supported when also passing a sa_column"
-                )
-            if ondelete is not Undefined:
-                raise RuntimeError(
-                    "Passing ondelete is not supported when also passing a sa_column"
-                )
-            if unique is not Undefined:
-                raise RuntimeError(
-                    "Passing unique is not supported when also passing a sa_column"
-                )
-            if index is not Undefined:
-                raise RuntimeError(
-                    "Passing index is not supported when also passing a sa_column"
-                )
-            if sa_type is not Undefined:
-                raise RuntimeError(
-                    "Passing sa_type is not supported when also passing a sa_column"
-                )
-        if sa_column_kwargs is not Undefined and "type_" in sa_column_kwargs:
-            raise RuntimeError(
-                "Passing type_ is not supported in sa_column_kwargs, "
-                "use sa_type instead"
-            )
-        if ondelete is not Undefined:
-            if foreign_key is Undefined:
-                raise RuntimeError("ondelete can only be used with foreign_key")
-        super().__init__(default=default, **kwargs)
-        self.primary_key = primary_key
-        self.nullable = nullable
-        self.foreign_key = foreign_key
-        self.ondelete = ondelete
-        self.unique = unique
-        self.index = index
-        self.sa_type = sa_type
-        self.sa_column = sa_column
-        self.sa_column_args = sa_column_args
-        self.sa_column_kwargs = sa_column_kwargs
-
-
-class RelationshipInfo(Representation):
-    def __init__(
-        self,
-        *,
-        back_populates: str | None = None,
-        cascade_delete: bool | None = False,
-        passive_deletes: bool | Literal["all"] | None = False,
-        link_model: Any | None = None,
-        sa_relationship: RelationshipProperty | None = None,
-        sa_relationship_args: Sequence[Any] | None = None,
-        sa_relationship_kwargs: Mapping[str, Any] | None = None,
-    ) -> None:
-        if sa_relationship is not None:
-            if sa_relationship_args is not None:
-                raise RuntimeError(
-                    "Passing sa_relationship_args is not supported when "
-                    "also passing a sa_relationship"
-                )
-            if sa_relationship_kwargs is not None:
-                raise RuntimeError(
-                    "Passing sa_relationship_kwargs is not supported when "
-                    "also passing a sa_relationship"
-                )
-        self.back_populates = back_populates
-        self.cascade_delete = cascade_delete
-        self.passive_deletes = passive_deletes
-        self.link_model = link_model
-        self.sa_relationship = sa_relationship
-        self.sa_relationship_args = sa_relationship_args
-        self.sa_relationship_kwargs = sa_relationship_kwargs
-
-
-@dataclass
-class FieldInfoMetadata:
-    primary_key: bool | UndefinedType = Undefined
-    nullable: bool | UndefinedType = Undefined
-    foreign_key: Any = Undefined
-    ondelete: OnDeleteType | UndefinedType = Undefined
-    unique: bool | UndefinedType = Undefined
-    index: bool | UndefinedType = Undefined
-    sa_type: SaTypeOrInstance | UndefinedType = Undefined
-    sa_column: Column[Any] | UndefinedType = Undefined
-    sa_column_args: Sequence[Any] | UndefinedType = Undefined
-    sa_column_kwargs: Mapping[str, Any] | UndefinedType = Undefined
-
-
-def _get_sqlmodel_field_metadata(field_info: Any) -> FieldInfoMetadata | None:
-    metadata_items = getattr(field_info, "metadata", None)
-    if metadata_items:
-        for meta in metadata_items:
-            if isinstance(meta, FieldInfoMetadata):
-                return meta
-    return None
-
-
-def _get_sqlmodel_field_value(
-    field_info: Any, attribute: str, default: Any = Undefined
-) -> Any:
-    metadata = _get_sqlmodel_field_metadata(field_info)
-    if metadata is not None and hasattr(metadata, attribute):
-        return getattr(metadata, attribute)
-    return getattr(field_info, attribute, default)
-
-
-# include sa_type, sa_column_args, sa_column_kwargs
-@overload
-def Field(
-    default: Any = Undefined,
-    *,
-    default_factory: NoArgAnyCallable | None = None,
-    alias: str | None = None,
-    validation_alias: str | None = None,
-    serialization_alias: str | None = None,
-    title: str | None = None,
-    description: str | None = None,
-    exclude: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    include: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    const: bool | None = None,
-    gt: float | None = None,
-    ge: float | None = None,
-    lt: float | None = None,
-    le: float | None = None,
-    multiple_of: float | None = None,
-    max_digits: int | None = None,
-    decimal_places: int | None = None,
-    min_items: Annotated[
-        int | None,
-        deprecated(MIN_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    max_items: Annotated[
-        int | None,
-        deprecated(MAX_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    unique_items: bool | None = None,
-    min_length: int | None = None,
-    max_length: int | None = None,
-    allow_mutation: bool = True,
-    regex: str | None = None,
-    discriminator: str | Discriminator | None = None,
-    repr: bool = True,
-    primary_key: bool | UndefinedType = Undefined,
-    foreign_key: Any = Undefined,
-    unique: bool | UndefinedType = Undefined,
-    nullable: bool | UndefinedType = Undefined,
-    index: bool | UndefinedType = Undefined,
-    sa_type: SaTypeOrInstance | UndefinedType = Undefined,
-    sa_column_args: Sequence[Any] | UndefinedType = Undefined,
-    sa_column_kwargs: Mapping[str, Any] | UndefinedType = Undefined,
-    schema_extra: dict[str, Any] | None = None,
-) -> Any: ...
-
-
-# When foreign_key is str, include ondelete
-# include sa_type, sa_column_args, sa_column_kwargs
-@overload
-def Field(
-    default: Any = Undefined,
-    *,
-    default_factory: NoArgAnyCallable | None = None,
-    alias: str | None = None,
-    validation_alias: str | None = None,
-    serialization_alias: str | None = None,
-    title: str | None = None,
-    description: str | None = None,
-    exclude: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    include: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    const: bool | None = None,
-    gt: float | None = None,
-    ge: float | None = None,
-    lt: float | None = None,
-    le: float | None = None,
-    multiple_of: float | None = None,
-    max_digits: int | None = None,
-    decimal_places: int | None = None,
-    min_items: Annotated[
-        int | None,
-        deprecated(MIN_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    max_items: Annotated[
-        int | None,
-        deprecated(MAX_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    unique_items: bool | None = None,
-    min_length: int | None = None,
-    max_length: int | None = None,
-    allow_mutation: bool = True,
-    regex: str | None = None,
-    discriminator: str | Discriminator | None = None,
-    repr: bool = True,
-    primary_key: bool | UndefinedType = Undefined,
-    foreign_key: str,
-    ondelete: OnDeleteType | UndefinedType = Undefined,
-    unique: bool | UndefinedType = Undefined,
-    nullable: bool | UndefinedType = Undefined,
-    index: bool | UndefinedType = Undefined,
-    sa_type: SaTypeOrInstance | UndefinedType = Undefined,
-    sa_column_args: Sequence[Any] | UndefinedType = Undefined,
-    sa_column_kwargs: Mapping[str, Any] | UndefinedType = Undefined,
-    schema_extra: dict[str, Any] | None = None,
-) -> Any: ...
-
-
-# Include sa_column, don't include
-# primary_key
-# foreign_key
-# ondelete
-# unique
-# nullable
-# index
-# sa_type
-# sa_column_args
-# sa_column_kwargs
-@overload
-def Field(
-    default: Any = Undefined,
-    *,
-    default_factory: NoArgAnyCallable | None = None,
-    alias: str | None = None,
-    validation_alias: str | None = None,
-    serialization_alias: str | None = None,
-    title: str | None = None,
-    description: str | None = None,
-    exclude: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    include: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    const: bool | None = None,
-    gt: float | None = None,
-    ge: float | None = None,
-    lt: float | None = None,
-    le: float | None = None,
-    multiple_of: float | None = None,
-    max_digits: int | None = None,
-    decimal_places: int | None = None,
-    min_items: Annotated[
-        int | None,
-        deprecated(MIN_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    max_items: Annotated[
-        int | None,
-        deprecated(MAX_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    unique_items: bool | None = None,
-    min_length: int | None = None,
-    max_length: int | None = None,
-    allow_mutation: bool = True,
-    regex: str | None = None,
-    discriminator: str | Discriminator | None = None,
-    repr: bool = True,
-    sa_column: Column[Any] | UndefinedType = Undefined,
-    schema_extra: dict[str, Any] | None = None,
-) -> Any: ...
-
-
-def Field(
-    default: Any = Undefined,
-    *,
-    default_factory: NoArgAnyCallable | None = None,
-    alias: str | None = None,
-    validation_alias: str | None = None,
-    serialization_alias: str | None = None,
-    title: str | None = None,
-    description: str | None = None,
-    exclude: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    include: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    const: bool | None = None,
-    gt: float | None = None,
-    ge: float | None = None,
-    lt: float | None = None,
-    le: float | None = None,
-    multiple_of: float | None = None,
-    max_digits: int | None = None,
-    decimal_places: int | None = None,
-    min_items: Annotated[
-        int | None,
-        deprecated(MIN_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    max_items: Annotated[
-        int | None,
-        deprecated(MAX_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    unique_items: bool | None = None,
-    min_length: int | None = None,
-    max_length: int | None = None,
-    allow_mutation: bool = True,
-    regex: str | None = None,
-    discriminator: str | Discriminator | None = None,
-    repr: bool = True,
-    primary_key: bool | UndefinedType = Undefined,
-    foreign_key: Any = Undefined,
-    ondelete: OnDeleteType | UndefinedType = Undefined,
-    unique: bool | UndefinedType = Undefined,
-    nullable: bool | UndefinedType = Undefined,
-    index: bool | UndefinedType = Undefined,
-    sa_type: SaTypeOrInstance | UndefinedType = Undefined,
-    sa_column: Column | UndefinedType = Undefined,
-    sa_column_args: Sequence[Any] | UndefinedType = Undefined,
-    sa_column_kwargs: Mapping[str, Any] | UndefinedType = Undefined,
-    schema_extra: dict[str, Any] | None = None,
-) -> Any:
-    current_schema_extra = schema_extra or {}
-
-    if min_items is not None:
-        warnings.warn(MIN_ITEMS_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
-        if min_length is None:
-            min_length = min_items
-    if max_items is not None:
-        warnings.warn(MAX_ITEMS_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
-        if max_length is None:
-            max_length = max_items
-
-    # Extract possible alias settings from schema_extra so we can control precedence
-    schema_validation_alias = current_schema_extra.pop("validation_alias", None)
-    schema_serialization_alias = current_schema_extra.pop("serialization_alias", None)
-    field_info_kwargs = {
-        "alias": alias,
-        "title": title,
-        "description": description,
-        "exclude": exclude,
-        "include": include,
-        "const": const,
-        "gt": gt,
-        "ge": ge,
-        "lt": lt,
-        "le": le,
-        "multiple_of": multiple_of,
-        "max_digits": max_digits,
-        "decimal_places": decimal_places,
-        "unique_items": unique_items,
-        "min_length": min_length,
-        "max_length": max_length,
-        "allow_mutation": allow_mutation,
-        "regex": regex,
-        "discriminator": discriminator,
-        "repr": repr,
-        "primary_key": primary_key,
-        "foreign_key": foreign_key,
-        "ondelete": ondelete,
-        "unique": unique,
-        "nullable": nullable,
-        "index": index,
-        "sa_type": sa_type,
-        "sa_column": sa_column,
-        "sa_column_args": sa_column_args,
-        "sa_column_kwargs": sa_column_kwargs,
-        **current_schema_extra,
-    }
-
-    # explicit params > schema_extra > alias propagation
-    field_info_kwargs["validation_alias"] = (
-        validation_alias or schema_validation_alias or alias
-    )
-    field_info_kwargs["serialization_alias"] = (
-        serialization_alias or schema_serialization_alias or alias
-    )
-
-    field_info = FieldInfo(
-        default,
-        default_factory=default_factory,
-        **field_info_kwargs,
-    )
-    field_metadata = FieldInfoMetadata(
-        primary_key=primary_key,
-        nullable=nullable,
-        foreign_key=foreign_key,
-        ondelete=ondelete,
-        unique=unique,
-        index=index,
-        sa_type=sa_type,
-        sa_column=sa_column,
-        sa_column_args=sa_column_args,
-        sa_column_kwargs=sa_column_kwargs,
-    )
-    if hasattr(field_info, "metadata"):
-        field_info.metadata.append(field_metadata)
-    return field_info
-
-
-@overload
-def Relationship(
-    *,
-    back_populates: str | None = None,
-    cascade_delete: bool | None = False,
-    passive_deletes: bool | Literal["all"] | None = False,
-    link_model: Any | None = None,
-    sa_relationship_args: Sequence[Any] | None = None,
-    sa_relationship_kwargs: Mapping[str, Any] | None = None,
-) -> Any: ...
-
-
-@overload
-def Relationship(
-    *,
-    back_populates: str | None = None,
-    cascade_delete: bool | None = False,
-    passive_deletes: bool | Literal["all"] | None = False,
-    link_model: Any | None = None,
-    sa_relationship: RelationshipProperty[Any] | None = None,
-) -> Any: ...
-
-
-def Relationship(
-    *,
-    back_populates: str | None = None,
-    cascade_delete: bool | None = False,
-    passive_deletes: bool | Literal["all"] | None = False,
-    link_model: Any | None = None,
-    sa_relationship: RelationshipProperty[Any] | None = None,
-    sa_relationship_args: Sequence[Any] | None = None,
-    sa_relationship_kwargs: Mapping[str, Any] | None = None,
-) -> Any:
-    relationship_info = RelationshipInfo(
-        back_populates=back_populates,
-        cascade_delete=cascade_delete,
-        passive_deletes=passive_deletes,
-        link_model=link_model,
-        sa_relationship=sa_relationship,
-        sa_relationship_args=sa_relationship_args,
-        sa_relationship_kwargs=sa_relationship_kwargs,
-    )
-    return relationship_info
 
 
 @dataclass_transform(kw_only_default=True, field_specifiers=(Field, FieldInfo))
@@ -728,121 +237,6 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
             DeclarativeMeta.__init__(cls, classname, bases, dict_, **kw)
         else:
             ModelMetaclass.__init__(cls, classname, bases, dict_, **kw)
-
-
-def get_sqlalchemy_type(field: Any) -> Any:
-    field_info = field
-    sa_type = _get_sqlmodel_field_value(field_info, "sa_type", Undefined)  # noqa: B009
-    if sa_type is not Undefined:
-        return sa_type
-
-    type_ = get_sa_type_from_field(field)
-    metadata = get_field_metadata(field)
-
-    # Check enums first as an enum can also be a str, needed by Pydantic/FastAPI
-    if issubclass(type_, Enum):
-        return sa_Enum(type_)
-    if issubclass(
-        type_,
-        (
-            str,
-            ipaddress.IPv4Address,
-            ipaddress.IPv4Network,
-            ipaddress.IPv6Address,
-            ipaddress.IPv6Network,
-            Path,
-            EmailStr,
-        ),
-    ):
-        max_length = getattr(metadata, "max_length", None)
-        if max_length:
-            return AutoString(length=max_length)
-        return AutoString
-    if issubclass(type_, float):
-        return Float
-    if issubclass(type_, bool):
-        return Boolean
-    if issubclass(type_, int):
-        return Integer
-    if issubclass(type_, (datetime, AwareDatetime, NaiveDatetime)):
-        if issubclass(type_, cast(type, NaiveDatetime)):
-            return DateTime(timezone=False)
-        return UTCDateTime()
-    if issubclass(type_, date):
-        return Date
-    if issubclass(type_, timedelta):
-        return Interval
-    if issubclass(type_, time):
-        return Time
-    if issubclass(type_, bytes):
-        return LargeBinary
-    if issubclass(type_, Decimal):
-        return Numeric(
-            precision=getattr(metadata, "max_digits", None),
-            scale=getattr(metadata, "decimal_places", None),
-        )
-    if issubclass(type_, uuid.UUID):
-        return Uuid
-    raise ValueError(f"{type_} has no matching SQLAlchemy type")
-
-
-def get_column_from_field(field: Any) -> Column:
-    field_info = field
-    sa_column = _get_sqlmodel_field_value(field_info, "sa_column", Undefined)
-    if isinstance(sa_column, Column):
-        return sa_column
-    sa_type = get_sqlalchemy_type(field)
-    primary_key = _get_sqlmodel_field_value(field_info, "primary_key", Undefined)
-    if primary_key is Undefined:
-        primary_key = False
-    index = _get_sqlmodel_field_value(field_info, "index", Undefined)
-    if index is Undefined:
-        index = False
-    nullable = not primary_key and is_field_noneable(field)
-    # Override derived nullability if the nullable property is set explicitly
-    # on the field
-    field_nullable = _get_sqlmodel_field_value(field_info, "nullable", Undefined)
-    if field_nullable is not Undefined:
-        assert not isinstance(field_nullable, UndefinedType)
-        nullable = field_nullable
-    args = []
-    foreign_key = _get_sqlmodel_field_value(field_info, "foreign_key", Undefined)
-    if foreign_key is Undefined:
-        foreign_key = None
-    unique = _get_sqlmodel_field_value(field_info, "unique", Undefined)
-    if unique is Undefined:
-        unique = False
-    if foreign_key:
-        ondelete_value = _get_sqlmodel_field_value(field_info, "ondelete", Undefined)
-        if ondelete_value is Undefined:
-            ondelete_value = None
-        if ondelete_value == "SET NULL" and not nullable:
-            raise RuntimeError('ondelete="SET NULL" requires nullable=True')
-        assert isinstance(foreign_key, str)
-        assert isinstance(ondelete_value, (str, type(None)))  # for typing
-        args.append(ForeignKey(foreign_key, ondelete=ondelete_value))
-    kwargs: dict[str, Any] = {
-        "primary_key": primary_key,
-        "nullable": nullable,
-        "index": index,
-        "unique": unique,
-    }
-    sa_default = Undefined
-    if field_info.default_factory:
-        sa_default = field_info.default_factory
-    elif field_info.default is not Undefined:
-        sa_default = field_info.default
-    if sa_default is not Undefined:
-        kwargs["default"] = sa_default
-    sa_column_args = _get_sqlmodel_field_value(field_info, "sa_column_args", Undefined)
-    if sa_column_args is not Undefined:
-        args.extend(list(cast(Sequence[Any], sa_column_args)))
-    sa_column_kwargs = _get_sqlmodel_field_value(
-        field_info, "sa_column_kwargs", Undefined
-    )
-    if sa_column_kwargs is not Undefined:
-        kwargs.update(cast(dict[Any, Any], sa_column_kwargs))
-    return Column(*args, type_=sa_type, **kwargs)
 
 
 default_registry = registry()

@@ -35,7 +35,8 @@ PYDANTIC_MINOR_VERSION = tuple(int(i) for i in P_VERSION.split(".")[:2])
 
 
 if TYPE_CHECKING:
-    from .main import RelationshipInfo, SQLModel
+    from ._relationships import RelationshipInfo
+    from .main import SQLModel
 
 UnionType = getattr(types, "UnionType", Union)
 NoneType = type(None)
