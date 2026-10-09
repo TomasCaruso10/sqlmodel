@@ -60,14 +60,32 @@ class InstanceDictProxy:
     def __set__(self, instance: BaseModel, values: dict[str, Any]) -> None:
         """Deliver prepared fields without replacing SQLAlchemy's state."""
         current = self.storage.__get__(instance, type(instance))
-        # Assignment keeps this instance's state in the validated dictionary.
-        # A different state belongs to a dictionary restoration, not an assignment.
-        if "_sa_instance_state" not in current or (
-            "_sa_instance_state" in values
-            and values["_sa_instance_state"] is not current["_sa_instance_state"]
+        if not self.has_orm_state(current) or self.receives_different_orm_state(
+            current, values
         ):
             self.storage.__set__(instance, values)
             return
+        self.deliver_fields(instance, current, values)
+
+    @staticmethod
+    def has_orm_state(values: dict[str, Any]) -> bool:
+        return "_sa_instance_state" in values
+
+    @staticmethod
+    def receives_different_orm_state(
+        current: dict[str, Any], values: dict[str, Any]
+    ) -> bool:
+        # Assignment keeps this instance's state in the validated dictionary.
+        # A different state belongs to a dictionary restoration, not an assignment.
+        return (
+            "_sa_instance_state" in values
+            and values["_sa_instance_state"] is not current["_sa_instance_state"]
+        )
+
+    @staticmethod
+    def deliver_fields(
+        instance: BaseModel, current: dict[str, Any], values: dict[str, Any]
+    ) -> None:
         for name, value in values.items():
             if name in current and current[name] is value:
                 continue
