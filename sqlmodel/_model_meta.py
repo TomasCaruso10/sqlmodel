@@ -9,13 +9,13 @@ from sqlalchemy.orm.decl_api import DeclarativeMeta
 from typing_extensions import dataclass_transform
 
 from ._compat import (
-    BaseConfig,
     ModelMetaclass,
     SQLModelConfig,
     Undefined,
     get_annotations,
 )
 from ._fields import Field, FieldInfo
+from ._model_config import ModelConfig
 from ._relationships import RelationshipInfo
 from ._table_model import TableMixin
 
@@ -47,14 +47,14 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
         class_dict: dict[str, Any],
         **kwargs: Any,
     ) -> Any:
-        bases = cls._model_bases(bases, class_dict, kwargs)
+        config = ModelConfig.from_declaration(bases, class_dict, kwargs)
+        bases = cls._model_bases(bases, config)
         namespace, relationship_annotations = cls._prepare_pydantic_namespace(
             class_dict
         )
-        config_kwargs = cls._pydantic_config_kwargs(kwargs)
         new_cls = cast(
             "type[SQLModel]",
-            super().__new__(cls, name, bases, namespace, **config_kwargs),
+            super().__new__(cls, name, bases, namespace, **config.pydantic_kwargs),
         )
         new_cls.__annotations__ = {
             **relationship_annotations,
@@ -62,10 +62,11 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
             **new_cls.__annotations__,
         }
 
-        config_table = cls._get_config(new_cls, "table", kwargs)
+        config = config.with_model_config(new_cls.model_config)
+        config_table = config.table
         new_cls._configure_model(table=config_table is True)
 
-        config_registry = cls._get_config(new_cls, "registry", kwargs)
+        config_registry = config.registry
         if config_registry is not Undefined:
             cls._configure_registry(
                 new_cls, cast(registry, config_registry), config_table
@@ -75,22 +76,10 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
     @staticmethod
     def _model_bases(
         bases: tuple[type[Any], ...],
-        class_dict: dict[str, Any],
-        kwargs: dict[str, Any],
+        config: ModelConfig,
     ) -> tuple[type[Any], ...]:
         """Select table behavior before Pydantic builds the class schema."""
-        config = {}
-        for base in bases:
-            config.update(getattr(base, "model_config", {}))
-        if "Config" in class_dict:
-            config["table"] = getattr(
-                class_dict["Config"], "table", config.get("table", Undefined)
-            )
-        config.update(class_dict.get("model_config", {}))
-        table = config.get("table", Undefined)
-        if table is Undefined:
-            table = kwargs.get("table", Undefined)
-        if table is not True:
+        if not config.is_table:
             return bases
         if any(issubclass(base, TableMixin) for base in bases):
             return bases
@@ -123,27 +112,6 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
             "__annotations__": pydantic_annotations,
         }
         return namespace, relationship_annotations
-
-    @staticmethod
-    def _pydantic_config_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-        # Duplicate logic from Pydantic to filter config kwargs because if they are
-        # passed directly including the registry Pydantic will pass them over to the
-        # superclass causing an error
-        allowed_config_kwargs: set[str] = {
-            key
-            for key in dir(BaseConfig)
-            if not (
-                key.startswith("__") and key.endswith("__")
-            )  # skip dunder methods and attributes
-        }
-        return {key: kwargs[key] for key in kwargs.keys() & allowed_config_kwargs}
-
-    @staticmethod
-    def _get_config(model: type[SQLModel], name: str, kwargs: dict[str, Any]) -> Any:
-        value = model.model_config.get(name, Undefined)
-        if value is not Undefined:
-            return value
-        return kwargs.get(name, Undefined)
 
     @staticmethod
     def _configure_registry(
