@@ -102,6 +102,16 @@ class SQLModel(
         cls, value: Any, handler: core_schema.ValidatorFunctionWrapHandler
     ) -> tuple[builtins.dict[str, Any], builtins.dict[str, Any] | None, set[str]]:
         """Preserve supplied ORM objects alongside Pydantic's validated fields."""
+        relationships = cls._relationship_values(value)
+        field_input = cls._input_without_relationships(value, relationships)
+        fields, extra, fields_set = handler(field_input)
+        # The dictionary proxy will deliver these objects through ORM setters.
+        # They remain excluded from Pydantic's fields and serialization.
+        fields.update(relationships)
+        return fields, extra, fields_set
+
+    @classmethod
+    def _relationship_values(cls, value: Any) -> builtins.dict[str, Any]:
         relationships = {}
         for name in cls.__sqlmodel_relationships__:
             related = (
@@ -111,15 +121,17 @@ class SQLModel(
             )
             if related is not Undefined:
                 relationships[name] = related
+        return relationships
+
+    @staticmethod
+    def _input_without_relationships(
+        value: Any, relationships: builtins.dict[str, Any]
+    ) -> Any:
         if isinstance(value, dict):
-            value = {
+            return {
                 name: item for name, item in value.items() if name not in relationships
             }
-        fields, extra, fields_set = handler(value)
-        # The dictionary proxy will deliver these objects through ORM setters.
-        # They remain excluded from Pydantic's fields and serialization.
-        fields.update(relationships)
-        return fields, extra, fields_set
+        return value
 
     def __repr_args__(self) -> Sequence[tuple[str | None, Any]]:
         # Don't show SQLAlchemy private attributes
