@@ -8,7 +8,12 @@ from pydantic._internal._fields import PydanticMetadata
 from pydantic._internal._model_construction import ModelMetaclass as ModelMetaclass
 from pydantic._internal._repr import Representation as Representation
 from pydantic.fields import FieldInfo
-from pydantic_core import PydanticUndefined, PydanticUndefinedType
+from pydantic_core import (
+    CoreSchema,
+    PydanticUndefined,
+    PydanticUndefinedType,
+    core_schema,
+)
 
 from ._typing import InstanceOrType
 
@@ -49,3 +54,24 @@ def get_field_metadata(field: Any) -> Any:
         if isinstance(meta, (PydanticMetadata, MaxLen)):
             return meta
     return FakeMetadata()
+
+
+def unwrap_validator_schema(
+    schema: CoreSchema,
+) -> tuple[
+    core_schema.BeforeValidatorFunctionSchema
+    | core_schema.AfterValidatorFunctionSchema
+    | core_schema.WrapValidatorFunctionSchema
+    | None,
+    CoreSchema,
+]:
+    """Return the innermost validator parent and its wrapped schema, without mutation."""
+    parent = None
+    while (
+        schema["type"] == "function-before"
+        or schema["type"] == "function-after"
+        or schema["type"] == "function-wrap"
+    ):
+        parent = schema
+        schema = schema["schema"]
+    return parent, schema

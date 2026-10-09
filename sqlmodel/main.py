@@ -35,6 +35,7 @@ from ._compat import (
     ModelMetaclass,
     SQLModelConfig,
     Undefined,
+    _pydantic,
     get_annotations,
     get_model_fields,
     init_pydantic_private_attrs,
@@ -284,26 +285,16 @@ class SQLModel(BaseModel, metaclass=SQLModelMetaclass, registry=default_registry
     ) -> CoreSchema:
         schema = handler(source)
         # Model validators can wrap the model node. Keep those wrappers intact.
-        model_schema = schema
-        while (
-            model_schema["type"] == "function-before"
-            or model_schema["type"] == "function-after"
-            or model_schema["type"] == "function-wrap"
-        ):
-            model_schema = model_schema["schema"]
+        _, model_schema = _pydantic.unwrap_validator_schema(schema)
         if model_schema["type"] == "model" and cls.__sqlmodel_relationships__:
             # Relationships remain ORM inputs, not Pydantic model fields.
             # Insert below before/wrap validators so their normalized input
             # reaches both field validation and relationship delivery.
-            parent = model_schema
-            fields_schema = parent["schema"]
-            while (
-                fields_schema["type"] == "function-before"
-                or fields_schema["type"] == "function-after"
-                or fields_schema["type"] == "function-wrap"
-            ):
-                parent = fields_schema
-                fields_schema = parent["schema"]
+            parent, fields_schema = _pydantic.unwrap_validator_schema(
+                model_schema["schema"]
+            )
+            if parent is None:
+                parent = model_schema
             parent["schema"] = core_schema.no_info_wrap_validator_function(
                 cls._validate_fields_with_relationships, fields_schema
             )
