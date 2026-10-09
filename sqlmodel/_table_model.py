@@ -176,20 +176,26 @@ class TableMixin(ModelMixin):
             self.__dict__[name] = value
             return
         if is_table_model_class(type(self)) and is_instrumented(self, name):
-            if name not in self.__sqlmodel_relationships__ and self.model_config.get(
-                "validate_assignment"
-            ):
-                previous = self.__dict__.get(name, Undefined)
-                super().__setattr__(name, value)
-                # The proxy delivers changed values. An explicit assignment of
-                # the same value must still trigger SQLAlchemy's setter once.
-                if self.__dict__[name] is previous:
-                    set_attribute(self, name, previous)
+            if self._requires_assignment_validation(name):
+                self._set_validated_attribute(name, value)
                 return
             set_attribute(self, name, value)
         # Relationships belong to SQLAlchemy; Pydantic manages other attributes.
         if name not in self.__sqlmodel_relationships__:
             super().__setattr__(name, value)
+
+    def _requires_assignment_validation(self, name: str) -> bool:
+        return name not in self.__sqlmodel_relationships__ and bool(
+            self.model_config.get("validate_assignment")
+        )
+
+    def _set_validated_attribute(self, name: str, value: Any) -> None:
+        previous = self.__dict__.get(name, Undefined)
+        super().__setattr__(name, value)
+        # The proxy delivers changed values. An explicit assignment of
+        # the same value must still trigger SQLAlchemy's setter once.
+        if self.__dict__[name] is previous:
+            set_attribute(self, name, previous)
 
     def __setstate__(self, state: builtins.dict[Any, Any]) -> None:
         # Restoration replaces all attributes. Clear the old dictionary so the
