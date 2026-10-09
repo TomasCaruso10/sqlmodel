@@ -99,6 +99,35 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
         class_dict: dict[str, Any],
         **kwargs: Any,
     ) -> Any:
+        namespace, relationship_annotations = cls._prepare_pydantic_namespace(
+            class_dict
+        )
+        config_kwargs = cls._pydantic_config_kwargs(kwargs)
+        new_cls = cast(
+            "type[SQLModel]",
+            super().__new__(cls, name, bases, namespace, **config_kwargs),
+        )
+        new_cls.__annotations__ = {
+            **relationship_annotations,
+            **namespace["__annotations__"],
+            **new_cls.__annotations__,
+        }
+
+        config_table = cls._get_config(new_cls, "table", kwargs)
+        if config_table is True:
+            cls._configure_table(new_cls)
+
+        config_registry = cls._get_config(new_cls, "registry", kwargs)
+        if config_registry is not Undefined:
+            cls._configure_registry(
+                new_cls, cast(registry, config_registry), config_table
+            )
+        return new_cls
+
+    @staticmethod
+    def _prepare_pydantic_namespace(
+        class_dict: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         relationships: dict[str, RelationshipInfo] = {}
         dict_for_pydantic = {}
         original_annotations = get_annotations(class_dict)
@@ -114,12 +143,16 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
                 relationship_annotations[k] = v
             else:
                 pydantic_annotations[k] = v
-        dict_used = {
+        namespace = {
             **dict_for_pydantic,
             "__weakref__": None,
             "__sqlmodel_relationships__": relationships,
             "__annotations__": pydantic_annotations,
         }
+        return namespace, relationship_annotations
+
+    @staticmethod
+    def _pydantic_config_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
         # Duplicate logic from Pydantic to filter config kwargs because if they are
         # passed directly including the registry Pydantic will pass them over to the
         # superclass causing an error
@@ -130,53 +163,43 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
                 key.startswith("__") and key.endswith("__")
             )  # skip dunder methods and attributes
         }
-        config_kwargs = {
-            key: kwargs[key] for key in kwargs.keys() & allowed_config_kwargs
-        }
-        new_cls = cast(
-            "SQLModel", super().__new__(cls, name, bases, dict_used, **config_kwargs)
-        )
-        new_cls.__annotations__ = {
-            **relationship_annotations,
-            **pydantic_annotations,
-            **new_cls.__annotations__,
-        }
+        return {key: kwargs[key] for key in kwargs.keys() & allowed_config_kwargs}
 
-        def get_config(name: str) -> Any:
-            config_class_value = new_cls.model_config.get(name, Undefined)
-            if config_class_value is not Undefined:
-                return config_class_value
-            kwarg_value = kwargs.get(name, Undefined)
-            if kwarg_value is not Undefined:
-                return kwarg_value
-            return Undefined
+    @staticmethod
+    def _get_config(model: type[SQLModel], name: str, kwargs: dict[str, Any]) -> Any:
+        value = model.model_config.get(name, Undefined)
+        if value is not Undefined:
+            return value
+        return kwargs.get(name, Undefined)
 
-        config_table = get_config("table")
-        if config_table is True:
-            # If it was passed by kwargs, ensure it's also set in config
-            new_cls.model_config["table"] = config_table
-            for k, v in get_model_fields(new_cls).items():
-                col = get_column_from_field(v)
-                setattr(new_cls, k, col)
-            # Set a config flag to tell FastAPI that this should be read with a field
-            # in orm_mode instead of preemptively converting it to a dict.
-            # This could be done by reading new_cls.model_config['table'] in FastAPI, but
-            # that's very specific about SQLModel, so let's have another config that
-            # other future tools based on Pydantic can use.
-            new_cls.model_config["read_from_attributes"] = True  # ty: ignore[invalid-key]
-            # For compatibility with older versions
-            # TODO: remove this in the future
-            new_cls.model_config["read_with_orm_mode"] = True  # ty: ignore[invalid-key]
+    @staticmethod
+    def _configure_table(model: type[SQLModel]) -> None:
+        # If it was passed by kwargs, ensure it's also set in config
+        model.model_config["table"] = True
+        for name, field in get_model_fields(model).items():
+            column = get_column_from_field(field)
+            setattr(model, name, column)
+        # Set a config flag to tell FastAPI that this should be read with a field
+        # in orm_mode instead of preemptively converting it to a dict.
+        # This could be done by reading model.model_config['table'] in FastAPI, but
+        # that's very specific about SQLModel, so let's have another config that
+        # other future tools based on Pydantic can use.
+        model.model_config["read_from_attributes"] = True  # ty: ignore[invalid-key]
+        # For compatibility with older versions
+        # TODO: remove this in the future
+        model.model_config["read_with_orm_mode"] = True  # ty: ignore[invalid-key]
 
-        config_registry = get_config("registry")
-        if config_registry is not Undefined:
-            config_registry = cast(registry, config_registry)
-            # If it was passed by kwargs, ensure it's also set in config
-            new_cls.model_config["registry"] = config_table
-            setattr(new_cls, "_sa_registry", config_registry)  # noqa: B010
-            setattr(new_cls, "metadata", config_registry.metadata)  # noqa: B010
-            setattr(new_cls, "__abstract__", True)  # noqa: B010
-        return new_cls
+    @staticmethod
+    def _configure_registry(
+        model: type[SQLModel],
+        config_registry: registry,
+        config_table: Any,
+    ) -> None:
+        # If it was passed by kwargs, ensure it's also set in config
+        model.model_config["registry"] = config_table
+        setattr(model, "_sa_registry", config_registry)  # noqa: B010
+        setattr(model, "metadata", config_registry.metadata)  # noqa: B010
+        setattr(model, "__abstract__", True)  # noqa: B010
 
     # Override SQLAlchemy, allow both SQLAlchemy and plain Pydantic models
     def __init__(
