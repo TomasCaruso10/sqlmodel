@@ -1,848 +1,62 @@
 from __future__ import annotations
 
 import builtins
-import ipaddress
-import uuid
-import warnings
-from collections.abc import Callable, Mapping, Sequence, Set
-from copy import deepcopy
-from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
-from decimal import Decimal
-from enum import Enum
-from functools import update_wrapper, wraps
-from pathlib import Path
+from collections.abc import Callable, Mapping, Sequence
 from typing import (
     TYPE_CHECKING,
-    Annotated,
     Any,
     ClassVar,
     Literal,
     TypeAlias,
     TypeVar,
     Union,
-    cast,
-    get_origin,
-    overload,
 )
 
-from pydantic import (
-    AwareDatetime,
-    BaseModel,
-    Discriminator,
-    EmailStr,
-    GetCoreSchemaHandler,
-    NaiveDatetime,
-)
-from pydantic.fields import FieldInfo as PydanticFieldInfo
+from pydantic import BaseModel, GetCoreSchemaHandler
 from pydantic_core import CoreSchema, core_schema
-from sqlalchemy import (
-    Boolean,
-    Column,
-    Date,
-    DateTime,
-    Float,
-    ForeignKey,
-    Integer,
-    Interval,
-    Numeric,
-    inspect,
-)
-from sqlalchemy import Enum as sa_Enum
 from sqlalchemy.orm import (
-    Mapped,
-    RelationshipProperty,
     declared_attr,
     registry,
-    relationship,
 )
-from sqlalchemy.orm.attributes import set_attribute
-from sqlalchemy.orm.decl_api import DeclarativeMeta
-from sqlalchemy.orm.instrumentation import is_instrumented
 from sqlalchemy.sql.schema import MetaData
-from sqlalchemy.sql.sqltypes import LargeBinary, Time, Uuid
-from sqlalchemy.types import TypeEngine
-from typing_extensions import dataclass_transform, deprecated
+from typing_extensions import deprecated
 
 from ._compat import (
     PYDANTIC_MINOR_VERSION,
-    BaseConfig,
-    InstanceDictProxy,
-    ModelMetaclass,
-    ObjectWithUpdateWrapper,
-    Representation,
     SQLModelConfig,
     Undefined,
-    UndefinedType,
-    get_annotations,
-    get_field_metadata,
+    _pydantic,
     get_model_fields,
-    get_relationship_to,
-    get_sa_type_from_field,
-    init_pydantic_private_attrs,
-    instance_from_fields,
-    is_field_noneable,
-    is_table_model_class,
 )
-from .sql.sqltypes import AutoString, UTCDateTime
+from ._construction import (
+    ObjectWithUpdateWrapper,
+)
+from ._fields import MAX_ITEMS_DEPRECATION_MSG as MAX_ITEMS_DEPRECATION_MSG
+from ._fields import MIN_ITEMS_DEPRECATION_MSG as MIN_ITEMS_DEPRECATION_MSG
+from ._fields import Field as Field
+from ._fields import FieldInfo as FieldInfo
+from ._fields import FieldInfoMetadata as FieldInfoMetadata
+from ._fields import NoArgAnyCallable as NoArgAnyCallable
+from ._fields import OnDeleteType as OnDeleteType
+from ._fields import SaTypeOrInstance as SaTypeOrInstance
+from ._fields import _get_sqlmodel_field_metadata as _get_sqlmodel_field_metadata
+from ._fields import _get_sqlmodel_field_value as _get_sqlmodel_field_value
+from ._fields import get_column_from_field as get_column_from_field
+from ._fields import get_sqlalchemy_type as get_sqlalchemy_type
+from ._model import ModelMixin
+from ._model_meta import SQLModelMetaclass as SQLModelMetaclass
+from ._relationships import Relationship as Relationship
+from ._relationships import RelationshipInfo as RelationshipInfo
 
 if TYPE_CHECKING:
-    from pydantic._internal._model_construction import ModelMetaclass as ModelMetaclass
-    from pydantic._internal._repr import Representation as Representation
     from pydantic_core import PydanticUndefined as Undefined
-    from pydantic_core import PydanticUndefinedType as UndefinedType
 
-NoArgAnyCallable = Callable[[], Any]
 IncEx: TypeAlias = (
     set[int]
     | set[str]
     | Mapping[int, Union["IncEx", bool]]
     | Mapping[str, Union["IncEx", bool]]
 )
-SaTypeOrInstance: TypeAlias = TypeEngine[Any] | type[TypeEngine[Any]]
-OnDeleteType = Literal["CASCADE", "SET NULL", "RESTRICT"]
-
-MIN_ITEMS_DEPRECATION_MSG = (
-    "`min_items` is deprecated and will be removed, use `min_length` instead"
-)
-MAX_ITEMS_DEPRECATION_MSG = (
-    "`max_items` is deprecated and will be removed, use `max_length` instead"
-)
-
-
-class FieldInfo(PydanticFieldInfo):  # ty: ignore[subclass-of-final-class]
-    # mypy - ignore that PydanticFieldInfo is @final
-    def __init__(self, default: Any = Undefined, **kwargs: Any) -> None:
-        primary_key = kwargs.pop("primary_key", False)
-        nullable = kwargs.pop("nullable", Undefined)
-        foreign_key = kwargs.pop("foreign_key", Undefined)
-        ondelete = kwargs.pop("ondelete", Undefined)
-        unique = kwargs.pop("unique", False)
-        index = kwargs.pop("index", Undefined)
-        sa_type = kwargs.pop("sa_type", Undefined)
-        sa_column = kwargs.pop("sa_column", Undefined)
-        sa_column_args = kwargs.pop("sa_column_args", Undefined)
-        sa_column_kwargs = kwargs.pop("sa_column_kwargs", Undefined)
-        if sa_column is not Undefined:
-            if sa_column_args is not Undefined:
-                raise RuntimeError(
-                    "Passing sa_column_args is not supported when "
-                    "also passing a sa_column"
-                )
-            if sa_column_kwargs is not Undefined:
-                raise RuntimeError(
-                    "Passing sa_column_kwargs is not supported when "
-                    "also passing a sa_column"
-                )
-            if primary_key is not Undefined:
-                raise RuntimeError(
-                    "Passing primary_key is not supported when also passing a sa_column"
-                )
-            if nullable is not Undefined:
-                raise RuntimeError(
-                    "Passing nullable is not supported when also passing a sa_column"
-                )
-            if foreign_key is not Undefined:
-                raise RuntimeError(
-                    "Passing foreign_key is not supported when also passing a sa_column"
-                )
-            if ondelete is not Undefined:
-                raise RuntimeError(
-                    "Passing ondelete is not supported when also passing a sa_column"
-                )
-            if unique is not Undefined:
-                raise RuntimeError(
-                    "Passing unique is not supported when also passing a sa_column"
-                )
-            if index is not Undefined:
-                raise RuntimeError(
-                    "Passing index is not supported when also passing a sa_column"
-                )
-            if sa_type is not Undefined:
-                raise RuntimeError(
-                    "Passing sa_type is not supported when also passing a sa_column"
-                )
-        if sa_column_kwargs is not Undefined and "type_" in sa_column_kwargs:
-            raise RuntimeError(
-                "Passing type_ is not supported in sa_column_kwargs, "
-                "use sa_type instead"
-            )
-        if ondelete is not Undefined:
-            if foreign_key is Undefined:
-                raise RuntimeError("ondelete can only be used with foreign_key")
-        super().__init__(default=default, **kwargs)
-        self.primary_key = primary_key
-        self.nullable = nullable
-        self.foreign_key = foreign_key
-        self.ondelete = ondelete
-        self.unique = unique
-        self.index = index
-        self.sa_type = sa_type
-        self.sa_column = sa_column
-        self.sa_column_args = sa_column_args
-        self.sa_column_kwargs = sa_column_kwargs
-
-
-class RelationshipInfo(Representation):
-    def __init__(
-        self,
-        *,
-        back_populates: str | None = None,
-        cascade_delete: bool | None = False,
-        passive_deletes: bool | Literal["all"] | None = False,
-        link_model: Any | None = None,
-        sa_relationship: RelationshipProperty | None = None,
-        sa_relationship_args: Sequence[Any] | None = None,
-        sa_relationship_kwargs: Mapping[str, Any] | None = None,
-    ) -> None:
-        if sa_relationship is not None:
-            if sa_relationship_args is not None:
-                raise RuntimeError(
-                    "Passing sa_relationship_args is not supported when "
-                    "also passing a sa_relationship"
-                )
-            if sa_relationship_kwargs is not None:
-                raise RuntimeError(
-                    "Passing sa_relationship_kwargs is not supported when "
-                    "also passing a sa_relationship"
-                )
-        self.back_populates = back_populates
-        self.cascade_delete = cascade_delete
-        self.passive_deletes = passive_deletes
-        self.link_model = link_model
-        self.sa_relationship = sa_relationship
-        self.sa_relationship_args = sa_relationship_args
-        self.sa_relationship_kwargs = sa_relationship_kwargs
-
-
-@dataclass
-class FieldInfoMetadata:
-    primary_key: bool | UndefinedType = Undefined
-    nullable: bool | UndefinedType = Undefined
-    foreign_key: Any = Undefined
-    ondelete: OnDeleteType | UndefinedType = Undefined
-    unique: bool | UndefinedType = Undefined
-    index: bool | UndefinedType = Undefined
-    sa_type: SaTypeOrInstance | UndefinedType = Undefined
-    sa_column: Column[Any] | UndefinedType = Undefined
-    sa_column_args: Sequence[Any] | UndefinedType = Undefined
-    sa_column_kwargs: Mapping[str, Any] | UndefinedType = Undefined
-
-
-def _get_sqlmodel_field_metadata(field_info: Any) -> FieldInfoMetadata | None:
-    metadata_items = getattr(field_info, "metadata", None)
-    if metadata_items:
-        for meta in metadata_items:
-            if isinstance(meta, FieldInfoMetadata):
-                return meta
-    return None
-
-
-def _get_sqlmodel_field_value(
-    field_info: Any, attribute: str, default: Any = Undefined
-) -> Any:
-    metadata = _get_sqlmodel_field_metadata(field_info)
-    if metadata is not None and hasattr(metadata, attribute):
-        return getattr(metadata, attribute)
-    return getattr(field_info, attribute, default)
-
-
-# include sa_type, sa_column_args, sa_column_kwargs
-@overload
-def Field(
-    default: Any = Undefined,
-    *,
-    default_factory: NoArgAnyCallable | None = None,
-    alias: str | None = None,
-    validation_alias: str | None = None,
-    serialization_alias: str | None = None,
-    title: str | None = None,
-    description: str | None = None,
-    exclude: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    include: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    const: bool | None = None,
-    gt: float | None = None,
-    ge: float | None = None,
-    lt: float | None = None,
-    le: float | None = None,
-    multiple_of: float | None = None,
-    max_digits: int | None = None,
-    decimal_places: int | None = None,
-    min_items: Annotated[
-        int | None,
-        deprecated(MIN_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    max_items: Annotated[
-        int | None,
-        deprecated(MAX_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    unique_items: bool | None = None,
-    min_length: int | None = None,
-    max_length: int | None = None,
-    allow_mutation: bool = True,
-    regex: str | None = None,
-    discriminator: str | Discriminator | None = None,
-    repr: bool = True,
-    primary_key: bool | UndefinedType = Undefined,
-    foreign_key: Any = Undefined,
-    unique: bool | UndefinedType = Undefined,
-    nullable: bool | UndefinedType = Undefined,
-    index: bool | UndefinedType = Undefined,
-    sa_type: SaTypeOrInstance | UndefinedType = Undefined,
-    sa_column_args: Sequence[Any] | UndefinedType = Undefined,
-    sa_column_kwargs: Mapping[str, Any] | UndefinedType = Undefined,
-    schema_extra: dict[str, Any] | None = None,
-) -> Any: ...
-
-
-# When foreign_key is str, include ondelete
-# include sa_type, sa_column_args, sa_column_kwargs
-@overload
-def Field(
-    default: Any = Undefined,
-    *,
-    default_factory: NoArgAnyCallable | None = None,
-    alias: str | None = None,
-    validation_alias: str | None = None,
-    serialization_alias: str | None = None,
-    title: str | None = None,
-    description: str | None = None,
-    exclude: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    include: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    const: bool | None = None,
-    gt: float | None = None,
-    ge: float | None = None,
-    lt: float | None = None,
-    le: float | None = None,
-    multiple_of: float | None = None,
-    max_digits: int | None = None,
-    decimal_places: int | None = None,
-    min_items: Annotated[
-        int | None,
-        deprecated(MIN_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    max_items: Annotated[
-        int | None,
-        deprecated(MAX_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    unique_items: bool | None = None,
-    min_length: int | None = None,
-    max_length: int | None = None,
-    allow_mutation: bool = True,
-    regex: str | None = None,
-    discriminator: str | Discriminator | None = None,
-    repr: bool = True,
-    primary_key: bool | UndefinedType = Undefined,
-    foreign_key: str,
-    ondelete: OnDeleteType | UndefinedType = Undefined,
-    unique: bool | UndefinedType = Undefined,
-    nullable: bool | UndefinedType = Undefined,
-    index: bool | UndefinedType = Undefined,
-    sa_type: SaTypeOrInstance | UndefinedType = Undefined,
-    sa_column_args: Sequence[Any] | UndefinedType = Undefined,
-    sa_column_kwargs: Mapping[str, Any] | UndefinedType = Undefined,
-    schema_extra: dict[str, Any] | None = None,
-) -> Any: ...
-
-
-# Include sa_column, don't include
-# primary_key
-# foreign_key
-# ondelete
-# unique
-# nullable
-# index
-# sa_type
-# sa_column_args
-# sa_column_kwargs
-@overload
-def Field(
-    default: Any = Undefined,
-    *,
-    default_factory: NoArgAnyCallable | None = None,
-    alias: str | None = None,
-    validation_alias: str | None = None,
-    serialization_alias: str | None = None,
-    title: str | None = None,
-    description: str | None = None,
-    exclude: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    include: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    const: bool | None = None,
-    gt: float | None = None,
-    ge: float | None = None,
-    lt: float | None = None,
-    le: float | None = None,
-    multiple_of: float | None = None,
-    max_digits: int | None = None,
-    decimal_places: int | None = None,
-    min_items: Annotated[
-        int | None,
-        deprecated(MIN_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    max_items: Annotated[
-        int | None,
-        deprecated(MAX_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    unique_items: bool | None = None,
-    min_length: int | None = None,
-    max_length: int | None = None,
-    allow_mutation: bool = True,
-    regex: str | None = None,
-    discriminator: str | Discriminator | None = None,
-    repr: bool = True,
-    sa_column: Column[Any] | UndefinedType = Undefined,
-    schema_extra: dict[str, Any] | None = None,
-) -> Any: ...
-
-
-def Field(
-    default: Any = Undefined,
-    *,
-    default_factory: NoArgAnyCallable | None = None,
-    alias: str | None = None,
-    validation_alias: str | None = None,
-    serialization_alias: str | None = None,
-    title: str | None = None,
-    description: str | None = None,
-    exclude: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    include: Set[int | str] | Mapping[int | str, Any] | Any = None,
-    const: bool | None = None,
-    gt: float | None = None,
-    ge: float | None = None,
-    lt: float | None = None,
-    le: float | None = None,
-    multiple_of: float | None = None,
-    max_digits: int | None = None,
-    decimal_places: int | None = None,
-    min_items: Annotated[
-        int | None,
-        deprecated(MIN_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    max_items: Annotated[
-        int | None,
-        deprecated(MAX_ITEMS_DEPRECATION_MSG),
-    ] = None,
-    unique_items: bool | None = None,
-    min_length: int | None = None,
-    max_length: int | None = None,
-    allow_mutation: bool = True,
-    regex: str | None = None,
-    discriminator: str | Discriminator | None = None,
-    repr: bool = True,
-    primary_key: bool | UndefinedType = Undefined,
-    foreign_key: Any = Undefined,
-    ondelete: OnDeleteType | UndefinedType = Undefined,
-    unique: bool | UndefinedType = Undefined,
-    nullable: bool | UndefinedType = Undefined,
-    index: bool | UndefinedType = Undefined,
-    sa_type: SaTypeOrInstance | UndefinedType = Undefined,
-    sa_column: Column | UndefinedType = Undefined,
-    sa_column_args: Sequence[Any] | UndefinedType = Undefined,
-    sa_column_kwargs: Mapping[str, Any] | UndefinedType = Undefined,
-    schema_extra: dict[str, Any] | None = None,
-) -> Any:
-    current_schema_extra = schema_extra or {}
-
-    if min_items is not None:
-        warnings.warn(MIN_ITEMS_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
-        if min_length is None:
-            min_length = min_items
-    if max_items is not None:
-        warnings.warn(MAX_ITEMS_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
-        if max_length is None:
-            max_length = max_items
-
-    # Extract possible alias settings from schema_extra so we can control precedence
-    schema_validation_alias = current_schema_extra.pop("validation_alias", None)
-    schema_serialization_alias = current_schema_extra.pop("serialization_alias", None)
-    field_info_kwargs = {
-        "alias": alias,
-        "title": title,
-        "description": description,
-        "exclude": exclude,
-        "include": include,
-        "const": const,
-        "gt": gt,
-        "ge": ge,
-        "lt": lt,
-        "le": le,
-        "multiple_of": multiple_of,
-        "max_digits": max_digits,
-        "decimal_places": decimal_places,
-        "unique_items": unique_items,
-        "min_length": min_length,
-        "max_length": max_length,
-        "allow_mutation": allow_mutation,
-        "regex": regex,
-        "discriminator": discriminator,
-        "repr": repr,
-        "primary_key": primary_key,
-        "foreign_key": foreign_key,
-        "ondelete": ondelete,
-        "unique": unique,
-        "nullable": nullable,
-        "index": index,
-        "sa_type": sa_type,
-        "sa_column": sa_column,
-        "sa_column_args": sa_column_args,
-        "sa_column_kwargs": sa_column_kwargs,
-        **current_schema_extra,
-    }
-
-    # explicit params > schema_extra > alias propagation
-    field_info_kwargs["validation_alias"] = (
-        validation_alias or schema_validation_alias or alias
-    )
-    field_info_kwargs["serialization_alias"] = (
-        serialization_alias or schema_serialization_alias or alias
-    )
-
-    field_info = FieldInfo(
-        default,
-        default_factory=default_factory,
-        **field_info_kwargs,
-    )
-    field_metadata = FieldInfoMetadata(
-        primary_key=primary_key,
-        nullable=nullable,
-        foreign_key=foreign_key,
-        ondelete=ondelete,
-        unique=unique,
-        index=index,
-        sa_type=sa_type,
-        sa_column=sa_column,
-        sa_column_args=sa_column_args,
-        sa_column_kwargs=sa_column_kwargs,
-    )
-    if hasattr(field_info, "metadata"):
-        field_info.metadata.append(field_metadata)
-    return field_info
-
-
-@overload
-def Relationship(
-    *,
-    back_populates: str | None = None,
-    cascade_delete: bool | None = False,
-    passive_deletes: bool | Literal["all"] | None = False,
-    link_model: Any | None = None,
-    sa_relationship_args: Sequence[Any] | None = None,
-    sa_relationship_kwargs: Mapping[str, Any] | None = None,
-) -> Any: ...
-
-
-@overload
-def Relationship(
-    *,
-    back_populates: str | None = None,
-    cascade_delete: bool | None = False,
-    passive_deletes: bool | Literal["all"] | None = False,
-    link_model: Any | None = None,
-    sa_relationship: RelationshipProperty[Any] | None = None,
-) -> Any: ...
-
-
-def Relationship(
-    *,
-    back_populates: str | None = None,
-    cascade_delete: bool | None = False,
-    passive_deletes: bool | Literal["all"] | None = False,
-    link_model: Any | None = None,
-    sa_relationship: RelationshipProperty[Any] | None = None,
-    sa_relationship_args: Sequence[Any] | None = None,
-    sa_relationship_kwargs: Mapping[str, Any] | None = None,
-) -> Any:
-    relationship_info = RelationshipInfo(
-        back_populates=back_populates,
-        cascade_delete=cascade_delete,
-        passive_deletes=passive_deletes,
-        link_model=link_model,
-        sa_relationship=sa_relationship,
-        sa_relationship_args=sa_relationship_args,
-        sa_relationship_kwargs=sa_relationship_kwargs,
-    )
-    return relationship_info
-
-
-@dataclass_transform(kw_only_default=True, field_specifiers=(Field, FieldInfo))
-class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
-    __sqlmodel_relationships__: dict[str, RelationshipInfo]
-    model_config: SQLModelConfig
-    model_fields: ClassVar[dict[str, FieldInfo]]
-
-    # Replicate SQLAlchemy
-    def __setattr__(cls, name: str, value: Any) -> None:  # ty: ignore[invalid-method-override]
-        if is_table_model_class(cls):
-            DeclarativeMeta.__setattr__(cls, name, value)
-        else:
-            super().__setattr__(name, value)
-
-    def __delattr__(cls, name: str) -> None:  # ty: ignore[invalid-method-override]
-        if is_table_model_class(cls):
-            DeclarativeMeta.__delattr__(cls, name)
-        else:
-            super().__delattr__(name)
-
-    # From Pydantic
-    def __new__(
-        cls,
-        name: str,
-        bases: tuple[type[Any], ...],
-        class_dict: dict[str, Any],
-        **kwargs: Any,
-    ) -> Any:
-        relationships: dict[str, RelationshipInfo] = {}
-        dict_for_pydantic = {}
-        original_annotations = get_annotations(class_dict)
-        pydantic_annotations = {}
-        relationship_annotations = {}
-        for k, v in class_dict.items():
-            if isinstance(v, RelationshipInfo):
-                relationships[k] = v
-            else:
-                dict_for_pydantic[k] = v
-        for k, v in original_annotations.items():
-            if k in relationships:
-                relationship_annotations[k] = v
-            else:
-                pydantic_annotations[k] = v
-        dict_used = {
-            **dict_for_pydantic,
-            "__weakref__": None,
-            "__sqlmodel_relationships__": relationships,
-            "__annotations__": pydantic_annotations,
-        }
-        # Duplicate logic from Pydantic to filter config kwargs because if they are
-        # passed directly including the registry Pydantic will pass them over to the
-        # superclass causing an error
-        allowed_config_kwargs: set[str] = {
-            key
-            for key in dir(BaseConfig)
-            if not (
-                key.startswith("__") and key.endswith("__")
-            )  # skip dunder methods and attributes
-        }
-        config_kwargs = {
-            key: kwargs[key] for key in kwargs.keys() & allowed_config_kwargs
-        }
-        new_cls = cast(
-            "SQLModel", super().__new__(cls, name, bases, dict_used, **config_kwargs)
-        )
-        new_cls.__annotations__ = {
-            **relationship_annotations,
-            **pydantic_annotations,
-            **new_cls.__annotations__,
-        }
-
-        def get_config(name: str) -> Any:
-            config_class_value = new_cls.model_config.get(name, Undefined)
-            if config_class_value is not Undefined:
-                return config_class_value
-            kwarg_value = kwargs.get(name, Undefined)
-            if kwarg_value is not Undefined:
-                return kwarg_value
-            return Undefined
-
-        config_table = get_config("table")
-        if config_table is True:
-            # If it was passed by kwargs, ensure it's also set in config
-            new_cls.model_config["table"] = config_table
-            for k, v in get_model_fields(new_cls).items():
-                col = get_column_from_field(v)
-                setattr(new_cls, k, col)
-            # Set a config flag to tell FastAPI that this should be read with a field
-            # in orm_mode instead of preemptively converting it to a dict.
-            # This could be done by reading new_cls.model_config['table'] in FastAPI, but
-            # that's very specific about SQLModel, so let's have another config that
-            # other future tools based on Pydantic can use.
-            new_cls.model_config["read_from_attributes"] = True  # ty: ignore[invalid-key]
-            # For compatibility with older versions
-            # TODO: remove this in the future
-            new_cls.model_config["read_with_orm_mode"] = True  # ty: ignore[invalid-key]
-
-        config_registry = get_config("registry")
-        if config_registry is not Undefined:
-            config_registry = cast(registry, config_registry)
-            # If it was passed by kwargs, ensure it's also set in config
-            new_cls.model_config["registry"] = config_table
-            setattr(new_cls, "_sa_registry", config_registry)  # noqa: B010
-            setattr(new_cls, "metadata", config_registry.metadata)  # noqa: B010
-            setattr(new_cls, "__abstract__", True)  # noqa: B010
-        return new_cls
-
-    # Override SQLAlchemy, allow both SQLAlchemy and plain Pydantic models
-    def __init__(
-        cls, classname: str, bases: tuple[type, ...], dict_: dict[str, Any], **kw: Any
-    ) -> None:
-        # Only one of the base classes (or the current one) should be a table model
-        # this allows FastAPI cloning a SQLModel for the response_model without
-        # trying to create a new SQLAlchemy, for a new table, with the same name, that
-        # triggers an error
-        base_is_table = any(is_table_model_class(base) for base in bases)
-        if is_table_model_class(cls) and not base_is_table:
-            for rel_name, rel_info in cls.__sqlmodel_relationships__.items():
-                if rel_info.sa_relationship:
-                    # There's a SQLAlchemy relationship declared, that takes precedence
-                    # over anything else, use that and continue with the next attribute
-                    setattr(cls, rel_name, rel_info.sa_relationship)  # Fix #315
-                    continue
-                raw_ann = cls.__annotations__[rel_name]
-                origin: Any = get_origin(raw_ann)
-                if origin is Mapped:
-                    ann = raw_ann.__args__[0]
-                else:
-                    ann = raw_ann
-                    # Plain forward references, for models not yet defined, are not
-                    # handled well by SQLAlchemy without Mapped, so, wrap the
-                    # annotations in Mapped here
-                    cls.__annotations__[rel_name] = Mapped[ann]
-                relationship_to = get_relationship_to(
-                    name=rel_name, rel_info=rel_info, annotation=ann
-                )
-                rel_kwargs: dict[str, Any] = {}
-                if rel_info.back_populates:
-                    rel_kwargs["back_populates"] = rel_info.back_populates
-                if rel_info.cascade_delete:
-                    rel_kwargs["cascade"] = "all, delete-orphan"
-                if rel_info.passive_deletes:
-                    rel_kwargs["passive_deletes"] = rel_info.passive_deletes
-                if rel_info.link_model:
-                    ins = inspect(rel_info.link_model)
-                    local_table = getattr(ins, "local_table")  # noqa: B009
-                    if local_table is None:
-                        raise RuntimeError(
-                            "Couldn't find the secondary table for "
-                            f"model {rel_info.link_model}"
-                        )
-                    rel_kwargs["secondary"] = local_table
-                rel_args: list[Any] = []
-                if rel_info.sa_relationship_args:
-                    rel_args.extend(rel_info.sa_relationship_args)
-                if rel_info.sa_relationship_kwargs:
-                    rel_kwargs.update(rel_info.sa_relationship_kwargs)
-                rel_value = relationship(relationship_to, *rel_args, **rel_kwargs)
-                setattr(cls, rel_name, rel_value)  # Fix #315
-            # SQLAlchemy no longer uses dict_
-            # Ref: https://github.com/sqlalchemy/sqlalchemy/commit/428ea01f00a9cc7f85e435018565eb6da7af1b77
-            # Tag: 1.4.36
-            DeclarativeMeta.__init__(cls, classname, bases, dict_, **kw)
-        else:
-            ModelMetaclass.__init__(cls, classname, bases, dict_, **kw)
-
-
-def get_sqlalchemy_type(field: Any) -> Any:
-    field_info = field
-    sa_type = _get_sqlmodel_field_value(field_info, "sa_type", Undefined)  # noqa: B009
-    if sa_type is not Undefined:
-        return sa_type
-
-    type_ = get_sa_type_from_field(field)
-    metadata = get_field_metadata(field)
-
-    # Check enums first as an enum can also be a str, needed by Pydantic/FastAPI
-    if issubclass(type_, Enum):
-        return sa_Enum(type_)
-    if issubclass(
-        type_,
-        (
-            str,
-            ipaddress.IPv4Address,
-            ipaddress.IPv4Network,
-            ipaddress.IPv6Address,
-            ipaddress.IPv6Network,
-            Path,
-            EmailStr,
-        ),
-    ):
-        max_length = getattr(metadata, "max_length", None)
-        if max_length:
-            return AutoString(length=max_length)
-        return AutoString
-    if issubclass(type_, float):
-        return Float
-    if issubclass(type_, bool):
-        return Boolean
-    if issubclass(type_, int):
-        return Integer
-    if issubclass(type_, (datetime, AwareDatetime, NaiveDatetime)):
-        if issubclass(type_, cast(type, NaiveDatetime)):
-            return DateTime(timezone=False)
-        return UTCDateTime()
-    if issubclass(type_, date):
-        return Date
-    if issubclass(type_, timedelta):
-        return Interval
-    if issubclass(type_, time):
-        return Time
-    if issubclass(type_, bytes):
-        return LargeBinary
-    if issubclass(type_, Decimal):
-        return Numeric(
-            precision=getattr(metadata, "max_digits", None),
-            scale=getattr(metadata, "decimal_places", None),
-        )
-    if issubclass(type_, uuid.UUID):
-        return Uuid
-    raise ValueError(f"{type_} has no matching SQLAlchemy type")
-
-
-def get_column_from_field(field: Any) -> Column:
-    field_info = field
-    sa_column = _get_sqlmodel_field_value(field_info, "sa_column", Undefined)
-    if isinstance(sa_column, Column):
-        return sa_column
-    sa_type = get_sqlalchemy_type(field)
-    primary_key = _get_sqlmodel_field_value(field_info, "primary_key", Undefined)
-    if primary_key is Undefined:
-        primary_key = False
-    index = _get_sqlmodel_field_value(field_info, "index", Undefined)
-    if index is Undefined:
-        index = False
-    nullable = not primary_key and is_field_noneable(field)
-    # Override derived nullability if the nullable property is set explicitly
-    # on the field
-    field_nullable = _get_sqlmodel_field_value(field_info, "nullable", Undefined)
-    if field_nullable is not Undefined:
-        assert not isinstance(field_nullable, UndefinedType)
-        nullable = field_nullable
-    args = []
-    foreign_key = _get_sqlmodel_field_value(field_info, "foreign_key", Undefined)
-    if foreign_key is Undefined:
-        foreign_key = None
-    unique = _get_sqlmodel_field_value(field_info, "unique", Undefined)
-    if unique is Undefined:
-        unique = False
-    if foreign_key:
-        ondelete_value = _get_sqlmodel_field_value(field_info, "ondelete", Undefined)
-        if ondelete_value is Undefined:
-            ondelete_value = None
-        if ondelete_value == "SET NULL" and not nullable:
-            raise RuntimeError('ondelete="SET NULL" requires nullable=True')
-        assert isinstance(foreign_key, str)
-        assert isinstance(ondelete_value, (str, type(None)))  # for typing
-        args.append(ForeignKey(foreign_key, ondelete=ondelete_value))
-    kwargs: dict[str, Any] = {
-        "primary_key": primary_key,
-        "nullable": nullable,
-        "index": index,
-        "unique": unique,
-    }
-    sa_default = Undefined
-    if field_info.default_factory:
-        sa_default = field_info.default_factory
-    elif field_info.default is not Undefined:
-        sa_default = field_info.default
-    if sa_default is not Undefined:
-        kwargs["default"] = sa_default
-    sa_column_args = _get_sqlmodel_field_value(field_info, "sa_column_args", Undefined)
-    if sa_column_args is not Undefined:
-        args.extend(list(cast(Sequence[Any], sa_column_args)))
-    sa_column_kwargs = _get_sqlmodel_field_value(
-        field_info, "sa_column_kwargs", Undefined
-    )
-    if sa_column_kwargs is not Undefined:
-        kwargs.update(cast(dict[Any, Any], sa_column_kwargs))
-    return Column(*args, type_=sa_type, **kwargs)
 
 
 default_registry = registry()
@@ -850,10 +64,11 @@ default_registry = registry()
 _TSQLModel = TypeVar("_TSQLModel", bound="SQLModel")
 
 
-class SQLModel(BaseModel, metaclass=SQLModelMetaclass, registry=default_registry):
+class SQLModel(
+    ModelMixin, BaseModel, metaclass=SQLModelMetaclass, registry=default_registry
+):
     # SQLAlchemy needs to set weakref(s), Pydantic will set the other slots values
     __slots__ = ("__weakref__",)
-    __dict__ = InstanceDictProxy()
     __tablename__: ClassVar[str | Callable[..., str]]
     __sqlmodel_relationships__: ClassVar[builtins.dict[str, RelationshipInfo]]
     __name__: ClassVar[str]
@@ -861,57 +76,22 @@ class SQLModel(BaseModel, metaclass=SQLModelMetaclass, registry=default_registry
     __allow_unmapped__ = True  # https://docs.sqlalchemy.org/en/20/changelog/migration_20.html#migration-20-step-six
     model_config = SQLModelConfig(from_attributes=True)
 
-    # Typing spec says `__new__` returning `Any` overrides normal constructor
-    # behavior, but a missing annotation does not:
-    def __new__(cls, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
-        new_object = super().__new__(cls)
-        # SQLAlchemy doesn't call __init__ on the base class when querying from DB
-        # Ref: https://docs.sqlalchemy.org/en/14/orm/constructors.html
-        # Set __fields_set__ here, that would have been set when calling __init__
-        # in the Pydantic model so that when SQLAlchemy sets attributes that are
-        # added (e.g. when querying from DB) to the __fields_set__, this already exists
-        init_pydantic_private_attrs(new_object)
-        return new_object
-
-    def __init__(__pydantic_self__, /, **data: Any) -> None:
-        # Uses something other than `self` the first arg to allow "self" as a
-        # settable attribute
-        # SQLAlchemy's generated initializer does not preserve positional-only args.
-        if instance_from_fields.get() is __pydantic_self__:
-            # SQLAlchemy has prepared its state; deliver fields without validating again.
-            __pydantic_self__.__dict__ = data
-        else:
-            super().__init__(**data)
-
-    # Preserve Pydantic's initializer marker without changing its static signature.
-    update_wrapper(__init__, BaseModel.__init__)
-
     @classmethod
     def __get_pydantic_core_schema__(
         cls, source: Any, handler: GetCoreSchemaHandler
     ) -> CoreSchema:
         schema = handler(source)
         # Model validators can wrap the model node. Keep those wrappers intact.
-        model_schema = schema
-        while (
-            model_schema["type"] == "function-before"
-            or model_schema["type"] == "function-after"
-            or model_schema["type"] == "function-wrap"
-        ):
-            model_schema = model_schema["schema"]
+        _, model_schema = _pydantic.unwrap_validator_schema(schema)
         if model_schema["type"] == "model" and cls.__sqlmodel_relationships__:
             # Relationships remain ORM inputs, not Pydantic model fields.
             # Insert below before/wrap validators so their normalized input
             # reaches both field validation and relationship delivery.
-            parent = model_schema
-            fields_schema = parent["schema"]
-            while (
-                fields_schema["type"] == "function-before"
-                or fields_schema["type"] == "function-after"
-                or fields_schema["type"] == "function-wrap"
-            ):
-                parent = fields_schema
-                fields_schema = parent["schema"]
+            parent, fields_schema = _pydantic.unwrap_validator_schema(
+                model_schema["schema"]
+            )
+            if parent is None:
+                parent = model_schema
             parent["schema"] = core_schema.no_info_wrap_validator_function(
                 cls._validate_fields_with_relationships, fields_schema
             )
@@ -922,6 +102,16 @@ class SQLModel(BaseModel, metaclass=SQLModelMetaclass, registry=default_registry
         cls, value: Any, handler: core_schema.ValidatorFunctionWrapHandler
     ) -> tuple[builtins.dict[str, Any], builtins.dict[str, Any] | None, set[str]]:
         """Preserve supplied ORM objects alongside Pydantic's validated fields."""
+        relationships = cls._relationship_values(value)
+        field_input = cls._input_without_relationships(value, relationships)
+        fields, extra, fields_set = handler(field_input)
+        # The dictionary proxy will deliver these objects through ORM setters.
+        # They remain excluded from Pydantic's fields and serialization.
+        fields.update(relationships)
+        return fields, extra, fields_set
+
+    @classmethod
+    def _relationship_values(cls, value: Any) -> builtins.dict[str, Any]:
         relationships = {}
         for name in cls.__sqlmodel_relationships__:
             related = (
@@ -931,90 +121,17 @@ class SQLModel(BaseModel, metaclass=SQLModelMetaclass, registry=default_registry
             )
             if related is not Undefined:
                 relationships[name] = related
+        return relationships
+
+    @staticmethod
+    def _input_without_relationships(
+        value: Any, relationships: builtins.dict[str, Any]
+    ) -> Any:
         if isinstance(value, dict):
-            value = {
+            return {
                 name: item for name, item in value.items() if name not in relationships
             }
-        fields, extra, fields_set = handler(value)
-        # The dictionary proxy will deliver these objects through ORM setters.
-        # They remain excluded from Pydantic's fields and serialization.
-        fields.update(relationships)
-        return fields, extra, fields_set
-
-    @classmethod
-    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
-        super().__pydantic_init_subclass__(**kwargs)
-        # Wait until Pydantic has prepared model_post_init, including private attributes.
-        # Pydantic calls model_post_init from both validation and model_construct.
-        # Preserve user overrides while preparing the ORM before they run.
-        if post_init := vars(cls).get("model_post_init"):
-
-            @wraps(post_init)
-            def model_post_init(self: SQLModel, context: Any) -> None:
-                self._initialize_orm()
-                post_init(self, context)
-
-            cls.model_post_init = model_post_init  # ty: ignore[invalid-assignment]
-
-    def model_post_init(self, context: Any) -> None:
-        self._initialize_orm()
-
-    def _initialize_orm(self) -> None:
-        """Deliver prepared fields through SQLAlchemy's native constructor."""
-        # Direct construction already ran SQLAlchemy's constructor. Validation
-        # and model_construct allocate through __new__ and still need it.
-        if (
-            is_table_model_class(type(self))
-            and "_sa_instance_state" not in self.__dict__
-        ):
-            values = self.__dict__.copy()
-            self.__dict__.clear()
-            token = instance_from_fields.set(self)
-            try:
-                type(self).__init__(self, **values)
-            finally:
-                instance_from_fields.reset(token)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        if name == "_sa_instance_state":
-            self.__dict__[name] = value
-            return
-        if is_table_model_class(type(self)) and is_instrumented(self, name):
-            if name not in self.__sqlmodel_relationships__ and self.model_config.get(
-                "validate_assignment"
-            ):
-                previous = self.__dict__.get(name, Undefined)
-                super().__setattr__(name, value)
-                # The proxy delivers changed values. An explicit assignment of
-                # the same value must still trigger SQLAlchemy's setter once.
-                if self.__dict__[name] is previous:
-                    set_attribute(self, name, previous)
-                return
-            set_attribute(self, name, value)
-        # Relationships belong to SQLAlchemy; Pydantic manages other attributes.
-        if name not in self.__sqlmodel_relationships__:
-            super().__setattr__(name, value)
-
-    def __setstate__(self, state: builtins.dict[Any, Any]) -> None:
-        # Restoration replaces all attributes. Clear the old dictionary so the
-        # proxy does not interpret restored fields as changes to an existing object.
-        if state.get("__dict__") is not self.__dict__:
-            self.__dict__.clear()
-        super().__setstate__(state)
-
-    def __deepcopy__(
-        self: _TSQLModel, memo: builtins.dict[int, Any] | None = None
-    ) -> _TSQLModel:
-        """Keep ORM back-references attached to the copied instance."""
-        if not is_table_model_class(type(self)):
-            return super().__deepcopy__(memo)
-        memo = {} if memo is None else memo
-        copied = type(self).__new__(type(self))
-        # ORM state points back to its owner. Register the copy before following
-        # that reference, so it resolves to this instance instead of another copy.
-        memo[id(self)] = copied
-        copied.__setstate__(deepcopy(self.__getstate__(), memo))
-        return copied
+        return value
 
     def __repr_args__(self) -> Sequence[tuple[str | None, Any]]:
         # Don't show SQLAlchemy private attributes
