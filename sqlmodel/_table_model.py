@@ -59,38 +59,48 @@ class TableMixin(ModelMixin):
     def _initialize_class(
         cls, classname: str, bases: tuple[type, ...], dict_: dict[str, Any], **kw: Any
     ) -> None:
+        if not cls._requires_mapping(bases):
+            return super()._initialize_class(classname, bases, dict_, **kw)
+
+        cls._install_relationships()
+        # SQLAlchemy no longer uses dict_
+        # Ref: https://github.com/sqlalchemy/sqlalchemy/commit/428ea01f00a9cc7f85e435018565eb6da7af1b77
+        # Tag: 1.4.36
+        DeclarativeMeta.__init__(
+            cast(DeclarativeMeta, cls), classname, bases, dict_, **kw
+        )
+
+    @classmethod
+    def _requires_mapping(cls, bases: tuple[type, ...]) -> bool:
         # Only one of the base classes (or the current one) should be a table model
         # this allows FastAPI cloning a SQLModel for the response_model without
         # trying to create a new SQLAlchemy, for a new table, with the same name, that
         # triggers an error
         base_is_table = any(is_table_model_class(base) for base in bases)
-        if is_table_model_class(cls) and not base_is_table:
-            for rel_name, rel_info in cls.__sqlmodel_relationships__.items():
-                if rel_info.sa_relationship:
-                    # There's a SQLAlchemy relationship declared, that takes precedence
-                    # over anything else, use that and continue with the next attribute
-                    setattr(cls, rel_name, rel_info.sa_relationship)  # Fix #315
-                    continue
-                raw_ann = cls.__annotations__[rel_name]
-                origin: Any = get_origin(raw_ann)
-                if origin is Mapped:
-                    ann = raw_ann.__args__[0]
-                else:
-                    ann = raw_ann
-                    # Plain forward references, for models not yet defined, are not
-                    # handled well by SQLAlchemy without Mapped, so, wrap the
-                    # annotations in Mapped here
-                    cls.__annotations__[rel_name] = Mapped[ann]
-                rel_value = rel_info.from_annotation(ann)
-                setattr(cls, rel_name, rel_value)  # Fix #315
-            # SQLAlchemy no longer uses dict_
-            # Ref: https://github.com/sqlalchemy/sqlalchemy/commit/428ea01f00a9cc7f85e435018565eb6da7af1b77
-            # Tag: 1.4.36
-            DeclarativeMeta.__init__(
-                cast(DeclarativeMeta, cls), classname, bases, dict_, **kw
-            )
-        else:
-            super()._initialize_class(classname, bases, dict_, **kw)
+        return is_table_model_class(cls) and not base_is_table
+
+    @classmethod
+    def _install_relationships(cls) -> None:
+        for name, info in cls.__sqlmodel_relationships__.items():
+            if info.sa_relationship:
+                # There's a SQLAlchemy relationship declared, that takes precedence
+                # over anything else, use that and continue with the next attribute
+                setattr(cls, name, info.sa_relationship)  # Fix #315
+                continue
+            annotation = cls._prepare_relationship_annotation(name)
+            relationship = info.from_annotation(annotation)
+            setattr(cls, name, relationship)  # Fix #315
+
+    @classmethod
+    def _prepare_relationship_annotation(cls, name: str) -> Any:
+        annotation = cls.__annotations__[name]
+        if get_origin(annotation) is Mapped:
+            return annotation.__args__[0]
+        # Plain forward references, for models not yet defined, are not
+        # handled well by SQLAlchemy without Mapped, so, wrap the
+        # annotations in Mapped here
+        cls.__annotations__[name] = Mapped[annotation]
+        return annotation
 
     @classmethod
     def _set_class_attribute(cls, name: str, value: Any) -> None:
