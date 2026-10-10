@@ -178,7 +178,9 @@ def test_foreign_key_deferral_preserves_database_definition(
     SQLModel.metadata.create_all(database_engine)
     with database_engine.begin() as connection:
         with pytest.raises(IntegrityError):
-            connection.execute(inspect(Child).local_table.insert().values())
+            connection.execute(
+                inspect(Child).local_table.insert().values(parent_id=None)
+            )
 
 
 def test_relationship_only_supplies_its_own_foreign_key() -> None:
