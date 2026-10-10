@@ -43,6 +43,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     Interval,
     Numeric,
@@ -84,6 +85,7 @@ from ._compat import (
     is_field_noneable,
     is_table_model_class,
 )
+from ._relationship_validation import ForeignKeyRules
 from .sql.sqltypes import AutoString, UTCDateTime
 
 if TYPE_CHECKING:
@@ -610,8 +612,20 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
             **dict_for_pydantic,
             "__weakref__": None,
             "__sqlmodel_relationships__": relationships,
+            "__sqlmodel_foreign_key_rules__": None,
             "__annotations__": pydantic_annotations,
         }
+        # Make the table flag available while Pydantic builds the core schema.
+        model_config = {
+            **{
+                k: v
+                for base in bases
+                for k, v in getattr(base, "model_config", {}).items()
+            },
+            **dict_used.get("model_config", {}),
+        }
+        if "table" not in model_config and "table" in kwargs:
+            dict_used["model_config"] = {**model_config, "table": kwargs["table"]}
         # Duplicate logic from Pydantic to filter config kwargs because if they are
         # passed directly including the registry Pydantic will pass them over to the
         # superclass causing an error
@@ -856,6 +870,7 @@ class SQLModel(BaseModel, metaclass=SQLModelMetaclass, registry=default_registry
     __dict__ = InstanceDictProxy()
     __tablename__: ClassVar[str | Callable[..., str]]
     __sqlmodel_relationships__: ClassVar[builtins.dict[str, RelationshipInfo]]
+    __sqlmodel_foreign_key_rules__: ClassVar[ForeignKeyRules | None]
     __name__: ClassVar[str]
     metadata: ClassVar[MetaData]
     __allow_unmapped__ = True  # https://docs.sqlalchemy.org/en/20/changelog/migration_20.html#migration-20-step-six
@@ -912,6 +927,22 @@ class SQLModel(BaseModel, metaclass=SQLModelMetaclass, registry=default_registry
             ):
                 parent = fields_schema
                 fields_schema = parent["schema"]
+            if is_table_model_class(cls) and fields_schema["type"] == "model-fields":
+                foreign_keys = set()
+                for name, field in get_model_fields(cls).items():
+                    foreign_key = _get_sqlmodel_field_value(field, "foreign_key")
+                    column = _get_sqlmodel_field_value(field, "sa_column")
+                    if isinstance(foreign_key, str) or (
+                        isinstance(column, Column) and column.foreign_keys
+                    ):
+                        foreign_keys.add(name)
+                for constraint in getattr(cls, "__table_args__", ()) or ():
+                    if isinstance(constraint, ForeignKeyConstraint):
+                        foreign_keys.update(constraint.column_keys)
+                # Refresh rules when building fields, not when Pydantic reuses
+                # this model's schema as a field of another model.
+                cls.__sqlmodel_foreign_key_rules__ = ForeignKeyRules(cls, foreign_keys)
+                fields_schema = cls.__sqlmodel_foreign_key_rules__.apply(fields_schema)
             parent["schema"] = core_schema.no_info_wrap_validator_function(
                 cls._validate_fields_with_relationships, fields_schema
             )
@@ -926,16 +957,20 @@ class SQLModel(BaseModel, metaclass=SQLModelMetaclass, registry=default_registry
         for name in cls.__sqlmodel_relationships__:
             related = (
                 value.get(name, Undefined)
-                if isinstance(value, dict)
+                if isinstance(value, Mapping)
                 else getattr(value, name, Undefined)
             )
             if related is not Undefined:
                 relationships[name] = related
-        if isinstance(value, dict):
+        if isinstance(value, Mapping):
             value = {
                 name: item for name, item in value.items() if name not in relationships
             }
         fields, extra, fields_set = handler(value)
+        if cls.__sqlmodel_foreign_key_rules__ is not None:
+            cls.__sqlmodel_foreign_key_rules__.validate(
+                fields, fields_set, relationships
+            )
         # The dictionary proxy will deliver these objects through ORM setters.
         # They remain excluded from Pydantic's fields and serialization.
         fields.update(relationships)
