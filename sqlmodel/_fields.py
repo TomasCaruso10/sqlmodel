@@ -72,6 +72,8 @@ MAX_ITEMS_DEPRECATION_MSG = (
 class FieldInfo(PydanticFieldInfo):  # ty: ignore[subclass-of-final-class]
     # mypy - ignore that PydanticFieldInfo is @final
     def __init__(self, default: Any = Undefined, **kwargs: Any) -> None:
+        polymorphic = kwargs.pop("polymorphic", Undefined)
+        polymorphic_identity = kwargs.pop("polymorphic_identity", Undefined)
         primary_key = kwargs.pop("primary_key", False)
         nullable = kwargs.pop("nullable", Undefined)
         foreign_key = kwargs.pop("foreign_key", Undefined)
@@ -130,6 +132,8 @@ class FieldInfo(PydanticFieldInfo):  # ty: ignore[subclass-of-final-class]
             if foreign_key is Undefined:
                 raise RuntimeError("ondelete can only be used with foreign_key")
         super().__init__(default=default, **kwargs)
+        self.polymorphic = polymorphic
+        self.polymorphic_identity = polymorphic_identity
         self.primary_key = primary_key
         self.nullable = nullable
         self.foreign_key = foreign_key
@@ -144,6 +148,8 @@ class FieldInfo(PydanticFieldInfo):  # ty: ignore[subclass-of-final-class]
 
 @dataclass
 class FieldInfoMetadata:
+    polymorphic: bool | UndefinedType = Undefined
+    polymorphic_identity: Any = Undefined
     primary_key: bool | UndefinedType = Undefined
     nullable: bool | UndefinedType = Undefined
     foreign_key: Any = Undefined
@@ -210,6 +216,8 @@ def Field(
     regex: str | None = None,
     discriminator: str | Discriminator | None = None,
     repr: bool = True,
+    polymorphic: bool | UndefinedType = Undefined,
+    polymorphic_identity: Any = Undefined,
     primary_key: bool | UndefinedType = Undefined,
     foreign_key: Any = Undefined,
     unique: bool | UndefinedType = Undefined,
@@ -259,6 +267,8 @@ def Field(
     regex: str | None = None,
     discriminator: str | Discriminator | None = None,
     repr: bool = True,
+    polymorphic: bool | UndefinedType = Undefined,
+    polymorphic_identity: Any = Undefined,
     primary_key: bool | UndefinedType = Undefined,
     foreign_key: str,
     ondelete: OnDeleteType | UndefinedType = Undefined,
@@ -317,6 +327,8 @@ def Field(
     regex: str | None = None,
     discriminator: str | Discriminator | None = None,
     repr: bool = True,
+    polymorphic: bool | UndefinedType = Undefined,
+    polymorphic_identity: Any = Undefined,
     sa_column: Column[Any] | UndefinedType = Undefined,
     schema_extra: dict[str, Any] | None = None,
 ) -> Any: ...
@@ -356,6 +368,8 @@ def Field(
     regex: str | None = None,
     discriminator: str | Discriminator | None = None,
     repr: bool = True,
+    polymorphic: bool | UndefinedType = Undefined,
+    polymorphic_identity: Any = Undefined,
     primary_key: bool | UndefinedType = Undefined,
     foreign_key: Any = Undefined,
     ondelete: OnDeleteType | UndefinedType = Undefined,
@@ -403,6 +417,8 @@ def Field(
         "regex": regex,
         "discriminator": discriminator,
         "repr": repr,
+        "polymorphic": polymorphic,
+        "polymorphic_identity": polymorphic_identity,
         "primary_key": primary_key,
         "foreign_key": foreign_key,
         "ondelete": ondelete,
@@ -430,6 +446,8 @@ def Field(
         **field_info_kwargs,
     )
     field_metadata = FieldInfoMetadata(
+        polymorphic=polymorphic,
+        polymorphic_identity=polymorphic_identity,
         primary_key=primary_key,
         nullable=nullable,
         foreign_key=foreign_key,

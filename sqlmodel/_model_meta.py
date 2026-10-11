@@ -15,7 +15,7 @@ from ._compat import (
 )
 from ._fields import Field, FieldInfo
 from ._model_config import ModelConfig
-from ._model_namespace import ModelNamespace
+from ._model_namespace import InheritedField, ModelNamespace
 from ._relationships import RelationshipInfo
 from ._table_model import TableMixin
 
@@ -48,8 +48,21 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
         **kwargs: Any,
     ) -> Any:
         config = ModelConfig.from_declaration(bases, class_dict, kwargs)
-        namespace = ModelNamespace.from_declaration(class_dict)
+        namespace = ModelNamespace.from_declaration(class_dict, bases)
+        if config.is_table and (
+            namespace.inherited_fields
+            or not any(getattr(base, "model_config", {}).get("table") for base in bases)
+        ):
+            namespace.prepare_mapper(name, bases)
         bases = cls._model_bases(bases, config)
+        pydantic_kwargs = config.pydantic_kwargs
+        if namespace.inherited_fields or namespace.mapper_config is not None:
+            # Descriptors expose inherited defaults without redeclaring fields.
+            ignored_types = config.option("ignored_types")
+            pydantic_kwargs["ignored_types"] = (
+                *(ignored_types if ignored_types is not Undefined else ()),
+                InheritedField,
+            )
         new_cls = cast(
             "type[SQLModel]",
             super().__new__(
@@ -57,7 +70,7 @@ class SQLModelMetaclass(ModelMetaclass, DeclarativeMeta):
                 name,
                 bases,
                 namespace.pydantic_namespace,
-                **config.pydantic_kwargs,
+                **pydantic_kwargs,
             ),
         )
         new_cls.__annotations__ = namespace.annotations_for(new_cls)

@@ -9,6 +9,7 @@ from functools import update_wrapper, wraps
 from typing import Any, cast, get_origin
 
 from pydantic import BaseModel
+from sqlalchemy import inspect
 from sqlalchemy.orm import Mapped
 from sqlalchemy.orm.attributes import set_attribute
 from sqlalchemy.orm.decl_api import DeclarativeMeta
@@ -47,7 +48,26 @@ class TableMixin(ModelMixin):
             return
         # If it was passed by kwargs, ensure it's also set in config
         cls.model_config["table"] = True
+        inherited_fields = {
+            name
+            for base in cls.__bases__
+            if is_table_model_class(base)
+            for name in get_model_fields(cast(type[BaseModel], base))
+        }
+        parent = next(
+            (inspect(base) for base in cls.__bases__ if is_table_model_class(base)),
+            None,
+        )
+        discriminator = (
+            parent.get_property_by_column(parent.polymorphic_on).key
+            if parent is not None and parent.polymorphic_on is not None
+            else None
+        )
         for name, field in get_model_fields(cls).items():
+            if name == discriminator:
+                continue
+            if name in inherited_fields and name not in cls.__annotations__:
+                continue
             column = get_column_from_field(field)
             setattr(cls, name, column)
         # Set a config flag to tell FastAPI that this should be read with a field
@@ -77,16 +97,19 @@ class TableMixin(ModelMixin):
 
     @classmethod
     def _requires_mapping(cls, bases: tuple[type, ...]) -> bool:
-        # Only one of the base classes (or the current one) should be a table model
-        # this allows FastAPI cloning a SQLModel for the response_model without
-        # trying to create a new SQLAlchemy, for a new table, with the same name, that
-        # triggers an error
+        # A named child table opts into SQLAlchemy's inheritance mapping. Keep
+        # ordinary descendants (including FastAPI response-model clones) unmapped.
         base_is_table = any(is_table_model_class(base) for base in bases)
-        return is_table_model_class(cls) and not base_is_table
+        return is_table_model_class(cls) and (
+            not base_is_table or "__tablename__" in vars(cls)
+        )
 
     @classmethod
     def _install_relationships(cls) -> None:
         for name, info in cls.__sqlmodel_relationships__.items():
+            if name not in cls.__annotations__:
+                # Joined subclasses inherit the relationship's native descriptor.
+                continue
             if info.sa_relationship:
                 # There's a SQLAlchemy relationship declared, that takes precedence
                 # over anything else, use that and continue with the next attribute
