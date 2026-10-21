@@ -90,6 +90,14 @@ class SQLModel(
             parent, fields_schema = _pydantic.unwrap_validator_schema(
                 model_schema["schema"]
             )
+            # Pydantic may return the same schema when this model is nested elsewhere.
+            if (
+                parent is not None
+                and parent["type"] == "function-wrap"
+                and parent["function"]["function"]
+                == cls._validate_fields_with_relationships
+            ):
+                return schema
             if parent is None:
                 parent = model_schema
             parent["schema"] = core_schema.no_info_wrap_validator_function(

@@ -15,6 +15,7 @@ from pydantic import (
     TypeAdapter,
     ValidationError,
     ValidationInfo,
+    create_model,
     field_validator,
     model_validator,
 )
@@ -351,6 +352,65 @@ def test_model_validate_runs_field_validator_once() -> None:
     assert inspect(item).object is item
     assert item.quantity == 2
     assert validated_values == [2]
+
+
+def test_reusing_relationship_schema_preserves_validation_and_backrefs(
+    database_engine: Engine,
+) -> None:
+    calls: list[str] = []
+
+    class Parent(SQLModel, table=True):
+        id: int | None = Field(default=None, primary_key=True)
+        name: str
+        children: list["Child"] = Relationship(back_populates="parent")
+
+        @model_validator(mode="wrap")
+        @classmethod
+        def record_wrap(
+            cls, value: Any, handler: ModelWrapValidatorHandler["Parent"]
+        ) -> "Parent":
+            calls.append("wrap_before")
+            result = handler(value)
+            calls.append("wrap_after")
+            return result
+
+        @model_validator(mode="before")
+        @classmethod
+        def normalize(cls, value: Any) -> Any:
+            calls.append("before")
+            return {"name": value["name"], "children": [value["child"]]}
+
+        @model_validator(mode="after")
+        def verify_backref(self) -> "Parent":
+            calls.append("after")
+            assert self.children[0].parent is self
+            return self
+
+    class Child(SQLModel, table=True):
+        id: int | None = Field(default=None, primary_key=True)
+        parent_id: int | None = Field(default=None, foreign_key="parent.id")
+        parent: Parent | None = Relationship(back_populates="children")
+
+    # Reusing a model in independent schemas must not grow its validator chain.
+    for index in range(400):
+        envelope = create_model(f"Envelope{index}", parent=(Parent, ...))
+
+    for mode in ("validation", "serialization"):
+        schema = envelope.model_json_schema(mode=mode)
+        assert schema["properties"]["parent"]["$ref"] == "#/$defs/Parent"
+        assert "name" in schema["$defs"]["Parent"]["properties"]
+
+    child = Child()
+    data = {"name": "Ada", "child": child}
+    parent = envelope.model_validate({"parent": data}).parent
+    assert calls == ["wrap_before", "before", "wrap_after", "after"]
+    assert parent.children[0] is child
+    assert data == {"name": "Ada", "child": child}
+    SQLModel.metadata.create_all(database_engine)
+    with Session(database_engine) as session:
+        session.add(parent)
+        session.flush()
+        assert child.parent_id == parent.id
 
 
 @pytest.mark.parametrize("operation", ["deepcopy", "model_copy"])
